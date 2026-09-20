@@ -1,0 +1,6 @@
+duckdb
+pandas
+pyarrow
+sentence-transformers
+numpy
+streamlit
