@@ -1,4 +1,6 @@
-# rnjsjffoodw
+# weat
+
+![Logo Description](assets/weat.jpg)
 
 A restaurant recommendation system built on Yelp-style business, review, and embedding data.
 
