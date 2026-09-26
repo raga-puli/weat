@@ -1,5 +1,9 @@
 # rnjsjffoodw
 
+A restaurant recommendation system built on Yelp-style business, review, and embedding data.
+
+The app is called WEat — a combination of "we" and "eat".
+
 ## Counts
 
 | metric | value |
