@@ -6,7 +6,20 @@ COPY (
   SELECT business_id, name, latitude, longitude,
          stars, review_count, categories, attributes
   FROM read_json_auto('data/raw/yelp_academic_dataset_business.json')
-  WHERE city = 'Philadelphia'
+  WHERE lower(trim(city)) IN (
+    'philadelphia',
+    'phila',
+    'philadephia',
+    'philadelphila',
+    'philiidelphia',
+    'philiadelphia',
+    'philly',
+    'philadelphia pa',
+    'southwest philadelphia',
+    'west philadelphia',
+    'center city philadelphia',
+    'philadelphia (northeast philly)'
+  )
     AND categories LIKE '%Restaurants%'
     AND review_count >= 20
 ) TO 'data/processed/restaurants.parquet'

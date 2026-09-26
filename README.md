@@ -1,5 +1,14 @@
 # rnjsjffoodw
 
+## Counts
+
+| metric | value |
+| --- | --- |
+| restaurants (review_count >= 20) | 3902 |
+| their reviews | 666849 |
+| users (5+ reviews) | 26093 |
+| those users' reviews | 399881 |
+
 restaurants.parquet
   business_id (str), name (str), latitude (float), longitude (float),
   stars (float), review_count (int), categories (str), price_level (int, 1-4)
