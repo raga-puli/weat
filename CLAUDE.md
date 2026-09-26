@@ -4,15 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A restaurant recommender built from the Yelp Academic Dataset, scoped to Philadelphia restaurants. The pipeline: raw Yelp JSON -> filtered/joined Parquet tables (DuckDB) -> sentence embeddings per restaurant (SentenceTransformers) -> similarity-based recommendation -> Streamlit UI.
+A group restaurant recommender built from the Yelp Academic Dataset, scoped to Philadelphia restaurants (see README.md). The pipeline: raw Yelp JSON -> filtered/joined Parquet tables (DuckDB) -> sentence embeddings per restaurant (SentenceTransformers) -> recommendation models -> offline evaluation against a held-out split.
+
+## File ownership (week 1)
+
+| Person | Owns |
+| --- | --- |
+| A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `tests/test_split.py`, `tests/test_recommend.py`, `README.md` |
+| B | `src/eval.py`, `src/baselines.py`, `results.md`, `tests/test_eval.py`, `tests/test_baselines.py` |
+| Shared, FROZEN after this commit | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore` |
+
+### Rules
+
+- Only edit files owned by the current person.
+- Never edit frozen files; if a change seems necessary, stop and tell the user instead.
+- Never edit `results.md` except via `python -m src.eval --log`.
+- Never evaluate on the test split unless the user explicitly says so.
+- Never commit anything under `data/`.
 
 ## Environment
 
-- Python virtualenv lives in `.venv`. Activate it before running anything:
-  - PowerShell: `.venv\Scripts\Activate.ps1`
-  - Bash: `source .venv/Scripts/activate`
+- Windows, PowerShell, CPU-only torch.
+- Python virtualenv lives in `.venv`. Activate it before running anything: `.venv\Scripts\Activate.ps1`
 - Install deps: `pip install -r requirements.txt` (duckdb, pandas, pyarrow, sentence-transformers, numpy, streamlit)
-- No test suite, linter, or build step currently exists in this repo.
 
 ## Pipeline (run in order)
 
