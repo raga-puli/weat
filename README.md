@@ -1,6 +1,6 @@
 # weat
 
-<img src="assets/weat.jpg" width="20%">
+<img src="assets/weat.jpg" width="70%">
 
 
 A restaurant recommendation system built on Yelp-style business, review, and embedding data.
