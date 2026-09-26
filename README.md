@@ -1,5 +1,7 @@
 # rnjsjffoodw
 
+A restaurant recommendation system built on Yelp-style business, review, and embedding data.
+
 restaurants.parquet
   business_id (str), name (str), latitude (float), longitude (float),
   stars (float), review_count (int), categories (str), price_level (int, 1-4)
