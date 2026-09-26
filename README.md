@@ -2,6 +2,8 @@
 
 A restaurant recommendation system built on Yelp-style business, review, and embedding data.
 
+The app is called WEat — a combination of "we" and "eat".
+
 restaurants.parquet
   business_id (str), name (str), latitude (float), longitude (float),
   stars (float), review_count (int), categories (str), price_level (int, 1-4)
