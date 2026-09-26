@@ -4,3 +4,4 @@ pyarrow
 sentence-transformers
 numpy
 streamlit
+pytest
