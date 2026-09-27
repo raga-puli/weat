@@ -64,6 +64,29 @@ def _load_eligible_reviews():
 
 
 def _write_business_ids(business_ids):
+    if BUSINESS_IDS.exists():
+        with open(BUSINESS_IDS) as f:
+            existing = [line.strip() for line in f if line.strip()]
+        if existing != business_ids:
+            first_diff = next(
+                i
+                for i in range(max(len(existing), len(business_ids)))
+                if i >= len(existing)
+                or i >= len(business_ids)
+                or existing[i] != business_ids[i]
+            )
+            old = existing[first_diff] if first_diff < len(existing) else "<missing>"
+            new = (
+                business_ids[first_diff]
+                if first_diff < len(business_ids)
+                else "<missing>"
+            )
+            raise ValueError(
+                f"business_ids.txt ordering would change at index {first_diff}: "
+                f"existing={old!r} new={new!r}. Refusing to overwrite; the two "
+                f"embedding files would no longer share one consistent row order."
+            )
+
     with open(BUSINESS_IDS, "w") as f:
         f.write("\n".join(business_ids) + "\n")
 
