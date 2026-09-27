@@ -1,7 +1,17 @@
+import random
+from collections import Counter
+
 import numpy as np
 import pandas as pd
+from scipy.stats import skew
 
-from src.interfaces import EMBEDDINGS, EMBEDDINGS_BLOB, RELEVANT_MIN_STARS, load_embeddings
+from src.interfaces import (
+    EMBEDDINGS,
+    EMBEDDINGS_BLOB,
+    RELEVANT_MIN_STARS,
+    SEED,
+    load_embeddings,
+)
 
 
 class ContentBased:
@@ -69,3 +79,72 @@ class ContentBased:
 class ContentBasedBlob(ContentBased):
     def __init__(self, embeddings_path=EMBEDDINGS_BLOB, name="content_blob"):
         super().__init__(embeddings_path=embeddings_path, name=name)
+
+
+class ContentBasedCentered(ContentBased):
+    """ContentBased over mean-centered, re-normalized embeddings.
+
+    Subtracting the catalog-wide mean vector before L2-normalizing
+    pulls apart restaurants that were only close together because
+    they all sat near the centroid of the embedding space (the
+    "hub" restaurants with thin, generic category tags).
+    """
+
+    def __init__(self, embeddings_path=EMBEDDINGS, name="content_centered"):
+        super().__init__(embeddings_path=embeddings_path, name=name)
+        centered = self.matrix - self.matrix.mean(axis=0)
+        norms = np.linalg.norm(centered, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self.matrix = centered / norms
+
+
+def hubness_diagnostics(recs, catalog_business_ids, seed=SEED, n_pairs=500):
+    """Diagnose how much a recs dict[user_id, list[business_id]]
+    collapses onto a small set of "hub" businesses.
+
+    Returns occurrence_skewness (skew of the per-catalog-item
+    occurrence count, zero counts included), the 10 most frequently
+    recommended items (with counts and share of users), the number
+    of unique items recommended, and the mean top-10 overlap between
+    `n_pairs` seeded random user pairs (Jaccard-style: shared items /
+    the larger of the two list sizes).
+    """
+    n_users = len(recs)
+
+    counts = Counter()
+    for items in recs.values():
+        counts.update(items)
+
+    occurrence = np.array([counts.get(b, 0) for b in catalog_business_ids])
+    occurrence_skewness = float(skew(occurrence)) if len(occurrence) else float("nan")
+
+    top10_most_frequent = [
+        {
+            "business_id": business_id,
+            "count": count,
+            "share_of_users": count / n_users if n_users else 0.0,
+        }
+        for business_id, count in counts.most_common(10)
+    ]
+
+    n_unique_items_recommended = int((occurrence > 0).sum())
+
+    rng = random.Random(seed)
+    user_ids = list(recs.keys())
+    overlaps = []
+    if len(user_ids) >= 2:
+        for _ in range(n_pairs):
+            u, v = rng.sample(user_ids, 2)
+            a, b = set(recs[u]), set(recs[v])
+            denom = max(len(a), len(b), 1)
+            overlaps.append(len(a & b) / denom)
+    mean_top10_overlap = float(np.mean(overlaps)) if overlaps else 0.0
+
+    return {
+        "n_users": n_users,
+        "occurrence_skewness": occurrence_skewness,
+        "top10_most_frequent": top10_most_frequent,
+        "n_unique_items_recommended": n_unique_items_recommended,
+        "mean_top10_overlap": mean_top10_overlap,
+        "n_pairs_sampled": len(overlaps),
+    }

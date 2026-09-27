@@ -42,13 +42,22 @@ def _build_reviews():
     for i, day in enumerate([1, 2, 3]):
         rows.append(_review(f"u4-r{i}", "u4", f"u4-b{i}", day))
 
+    # u5: 5 distinct businesses (b1..b5), so b5 becomes their test
+    # business (day 5) and b4 their val business (day 4). u5 then
+    # revisits b5 again later (day 10) -- a duplicate review of the
+    # held-out business that the old review_id-only exclusion would
+    # have left sitting in train.
+    for i, day in enumerate([1, 2, 3, 4, 5]):
+        rows.append(_review(f"u5-r{i+1}", "u5", f"u5-b{i+1}", day))
+    rows.append(_review("u5-r5b", "u5", "u5-b5", 10))
+
     return pd.DataFrame(rows)
 
 
 def _build_users():
     # Mirrors users.parquet: only users with 5+ raw reviews are
     # present at all (u4 is excluded here, same as prep.py's HAVING).
-    return pd.DataFrame({"user_id": ["u1", "u2", "u3"]})
+    return pd.DataFrame({"user_id": ["u1", "u2", "u3", "u5"]})
 
 
 def test_no_review_id_in_more_than_one_split():
@@ -69,11 +78,11 @@ def test_each_eligible_user_has_exactly_one_val_and_test_row():
     val_counts = result.val["user_id"].value_counts()
     test_counts = result.test["user_id"].value_counts()
 
-    assert set(val_counts.index) == {"u1", "u2"}
-    assert set(test_counts.index) == {"u1", "u2"}
+    assert set(val_counts.index) == {"u1", "u2", "u5"}
+    assert set(test_counts.index) == {"u1", "u2", "u5"}
     assert (val_counts == 1).all()
     assert (test_counts == 1).all()
-    assert result.n_users_split == 2
+    assert result.n_users_split == 3
 
     # u3 qualifies on raw count but drops below 5 after dedup, and
     # must not be split.
@@ -84,7 +93,7 @@ def test_each_eligible_user_has_exactly_one_val_and_test_row():
 def test_test_date_after_val_date_after_max_train_date_per_user():
     result = split_reviews(_build_reviews(), _build_users())
 
-    for user_id in ["u1", "u2"]:
+    for user_id in ["u1", "u2", "u5"]:
         val_date = result.val.loc[
             result.val["user_id"] == user_id, "date"
         ].iloc[0]
@@ -96,6 +105,21 @@ def test_test_date_after_val_date_after_max_train_date_per_user():
         ].max()
 
         assert test_date >= val_date >= max_train_date
+
+
+def test_repeat_review_of_held_out_business_is_fully_removed_from_train():
+    result = split_reviews(_build_reviews(), _build_users())
+
+    # u5's test business is b5 (day 5); they reviewed it again on day
+    # 10, and that duplicate must not leak into train either.
+    assert not (
+        (result.train["user_id"] == "u5") & (result.train["business_id"] == "u5-b5")
+    ).any()
+    assert "u5-r5b" not in set(result.train["review_id"])
+    assert (result.train["user_id"] == "u5").sum() == 3  # only b1, b2, b3 remain
+
+    assert result.repeat_reviews_removed == 1
+    assert result.users_with_repeat_reviews == 1
 
 
 def test_users_with_fewer_than_5_reviews_appear_only_in_train():
