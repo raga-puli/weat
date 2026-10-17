@@ -19,7 +19,8 @@ Hard constraints filter; they never rank:
   fewer than k results can come back.
 
 Ranking: by cosine similarity to the embedded soft text when soft is non-empty, otherwise by
-stars * ln(1 + review_count). Ties break on business_id (byte order) so both versions agree.
+stars * ln(1 + review_count). Popularity ties break on business_id (byte order) so both versions
+agree; the similarity ORDER BY has no tie-break so pgvector indexes can be used.
 """
 
 import argparse
@@ -173,17 +174,19 @@ def build_query(parsed: ParsedQuery, k: int, query_vec=None, include_null_price:
             raise ValueError("query_vec is required when parsed.soft is non-empty")
         select.append("1 - (embedding <=> %s) AS similarity")
         select_params.append(query_vec)
+        # A bare distance ORDER BY lets pgvector indexes serve the query; a second sort key
+        # forces a seq scan + sort. Exact cosine ties are vanishingly rare, so no tie-break.
         order = "embedding <=> %s"
         order_params.append(query_vec)
     else:
         select.append("NULL::double precision AS similarity")
-        order = "stars * ln(1 + review_count) DESC"
+        order = 'stars * ln(1 + review_count) DESC, business_id COLLATE "C"'
 
     limit = k * OPEN_AT_OVERFETCH if parsed.open_at else k
     sql = f"SELECT {', '.join(select)}\nFROM restaurants"
     if where:
         sql += "\nWHERE " + "\n  AND ".join(where)
-    sql += f'\nORDER BY {order}, business_id COLLATE "C"\nLIMIT %s'
+    sql += f"\nORDER BY {order}\nLIMIT %s"
     return sql, select_params + where_params + order_params + [limit]
 
 
@@ -246,52 +249,72 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
 
 
+_prepared: dict = {}
+
+# Joins strings for vectorized matching; it can't appear in a category, a name, or a query word.
+_SEP = "\x1f"
+
+
+def _prepare(frame: pd.DataFrame, emb: np.ndarray) -> dict:
+    """Per-dataset arrays search_numpy reuses on every query, built once."""
+    key = (id(frame), id(emb))
+    if key not in _prepared:
+        cats = frame["categories"]
+        dietary_attr = [str((a or {}).get("DietaryRestrictions") or "") for a in frame["attributes"]]
+        _prepared[key] = {
+            "ids": frame["business_id"].to_numpy(),
+            "price": frame["price_level"].astype("Float64").to_numpy(dtype=np.float64, na_value=np.nan),
+            "lat": frame["latitude"].to_numpy(dtype=np.float64),
+            "lon": frame["longitude"].to_numpy(dtype=np.float64),
+            "popularity": frame["stars"].to_numpy(dtype=np.float64) * np.log1p(frame["review_count"].to_numpy()),
+            # exact (case-sensitive) category membership, like `%s = ANY(categories)`
+            "cat_exact": np.array([_SEP + _SEP.join(c) + _SEP for c in cats]),
+            # case-insensitive substring of any category or the name, like ILIKE
+            "cat_or_name": np.array([(_SEP.join(c) + _SEP + n).lower() for c, n in zip(cats, frame["name"])]),
+            "dietary_attr": np.array(dietary_attr),
+            "emb64": emb.astype(np.float64),
+        }
+    return _prepared[key]
+
+
 def search_numpy(
     parsed: ParsedQuery, k: int = 10, include_null_price: bool = False, data=None
 ) -> list[dict]:
     """Same filters and ranking as search(), on the parquet + .npy. data=(frame, emb) overrides the files."""
     frame, emb = data if data is not None else load_frame()
+    arr = _prepare(frame, emb)
     mask = np.ones(len(frame), dtype=bool)
 
     if parsed.max_price_level is not None:
-        price = frame["price_level"].astype("Float64")
-        ok = (price <= parsed.max_price_level).fillna(include_null_price)
-        mask &= ok.to_numpy(dtype=bool)
+        price = arr["price"]
+        mask &= np.where(np.isnan(price), include_null_price, price <= parsed.max_price_level)
 
     distance = np.full(len(frame), np.nan)
     if parsed.near is not None:
         lat, lon = ANCHORS[parsed.near]
-        distance = haversine_km(lat, lon, frame["latitude"].to_numpy(), frame["longitude"].to_numpy())
+        distance = haversine_km(lat, lon, arr["lat"], arr["lon"])
         mask &= distance <= (parsed.max_distance_km or DEFAULT_NEAR_KM)
 
     for tag in parsed.dietary:
-        label = DIETARY_CATEGORY[tag]
-        needle = _dietary_attribute_pattern(tag).strip("%")
-        mask &= np.array(
-            [
-                label in cats or needle in str((attrs or {}).get("DietaryRestrictions") or "")
-                for cats, attrs in zip(frame["categories"], frame["attributes"])
-            ]
-        )
+        in_category = np.char.find(arr["cat_exact"], _SEP + DIETARY_CATEGORY[tag] + _SEP) >= 0
+        in_attribute = np.char.find(arr["dietary_attr"], _dietary_attribute_pattern(tag).strip("%")) >= 0
+        mask &= in_category | in_attribute
 
     if parsed.categories:
-        wanted = [c.lower() for c in parsed.categories]
-        mask &= np.array(
-            [
-                any(w in c.lower() for w in wanted for c in cats) or any(w in name.lower() for w in wanted)
-                for cats, name in zip(frame["categories"], frame["name"])
-            ]
-        )
+        any_match = np.zeros(len(frame), dtype=bool)
+        for category in parsed.categories:
+            any_match |= np.char.find(arr["cat_or_name"], category.lower()) >= 0
+        mask &= any_match
 
     idx = np.flatnonzero(mask)
-    ids = frame["business_id"].to_numpy()[idx]
+    ids = arr["ids"][idx]
     if parsed.soft:
-        similarity = emb[idx].astype(np.float64) @ embed(parsed.soft).astype(np.float64)
+        # scoring every row and then indexing avoids copying the embedding rows
+        similarity = (arr["emb64"] @ embed(parsed.soft).astype(np.float64))[idx]
         order = np.lexsort((ids, -similarity))
     else:
         similarity = np.full(len(idx), np.nan)
-        popularity = frame["stars"].to_numpy(dtype=np.float64)[idx] * np.log1p(frame["review_count"].to_numpy()[idx])
-        order = np.lexsort((ids, -popularity))
+        order = np.lexsort((ids, -arr["popularity"][idx]))
 
     limit = k * OPEN_AT_OVERFETCH if parsed.open_at else k
     rows = []
