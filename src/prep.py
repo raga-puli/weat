@@ -1,10 +1,20 @@
+import argparse
+import sys
+
 import duckdb
+
+# --stage restaurants rebuilds only restaurants.parquet and leaves
+# reviews.parquet / users.parquet untouched.
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage", choices=["all", "restaurants"], default="all")
+args = parser.parse_args()
 
 con = duckdb.connect()
 con.execute("""
 COPY (
   SELECT business_id, name, latitude, longitude,
-         stars, review_count, categories, attributes
+         stars, review_count, categories, attributes,
+         to_json(hours) AS hours
   FROM read_json_auto('data/raw/yelp_academic_dataset_business.json')
   WHERE lower(trim(city)) IN (
     'philadelphia',
@@ -25,13 +35,13 @@ COPY (
 ) TO 'data/processed/restaurants.parquet'
 """)
 
-print(con.execute("SELECT count(*) FROM 'data/processed/restaurants.parquet'").fetchone())  
+n_restaurants, n_with_hours = con.execute("""
+    SELECT count(*), count(hours) FROM 'data/processed/restaurants.parquet'
+""").fetchone()
+print(f"restaurants: {n_restaurants} rows, {n_with_hours} with hours")
 
-print(con.execute("""
-    SELECT name, stars, review_count, categories
-    FROM 'data/processed/restaurants.parquet'
-    ORDER BY random() LIMIT 20
-""").df().to_string())
+if args.stage == "restaurants":
+    sys.exit(0)
 
 con.execute("""
 COPY (
