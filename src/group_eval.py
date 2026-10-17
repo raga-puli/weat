@@ -13,13 +13,15 @@ reviews of it. `target_leak_flags` measures how many groups that affects.
 import argparse
 import hashlib
 from dataclasses import dataclass
+from datetime import date
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import binomtest
 
-from src.aggregate import NORMS, TAU, fairness_repeated, normalize
+from src.aggregate import LAMBDA, NORMS, TAU, fairness_repeated, normalize
 from src.aggregate import STRATEGIES as AGGREGATORS
 from src.groups import GROUPS, MIN_PRIOR_LIKES
 from src.interfaces import DATA, RELEVANT_MIN_STARS, SEED, TRAIN_REVIEWS
@@ -30,7 +32,21 @@ N_BOOTSTRAP = 1000
 CONTENT_STRATEGIES = ("average", "least_misery", "fairness", "fairness_repeated")
 ALL_STRATEGIES = ("random", "popularity", *CONTENT_STRATEGIES)
 METRICS = ("hit", "ndcg", "group_score", "worst_member", "fairness_gap")
+# Per-restaurant variants: reported alongside, never instead of, METRICS.
+SECONDARY_METRICS = ("worst_member_per_item", "fairness_gap_per_item")
 BUCKET_ORDER = ["low", "mid", "high"]
+TERCILE_ORDER = ["bottom", "middle", "top"]
+# The only results file this module writes, and only via --log.
+GROUPS_RESULTS = Path("results/groups.md")
+GROUPS_RESULTS_HEADER = (
+    "# Group evaluation results\n\n"
+    "Written only by `python -m src.group_eval --log`. group score, worst member and fairness gap\n"
+    "are PREDICTED (member rank percentiles from the model), not observed satisfaction;\n"
+    "hit@10 and NDCG@10 are against the held-out target. CIs are cluster bootstraps over targets.\n\n"
+    "| date | split | strategy | config | n_groups | hit@10 [CI] | NDCG@10 "
+    "| group score (PREDICTED) | worst member (PREDICTED) | fairness gap (PREDICTED) | note |\n"
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+)
 
 
 @dataclass
@@ -85,12 +101,17 @@ def _list_metrics(top: np.ndarray, target_idx: int, pct: np.ndarray) -> dict:
     percentile over the candidate set (NaN for excluded, never in top)."""
     hits = np.flatnonzero(top == target_idx)
     member_means = pct[:, top].mean(axis=1)
+    per_item = pct[:, top]
     return {
         "hit": float(len(hits) > 0),
         "ndcg": float(1 / np.log2(hits[0] + 2)) if len(hits) else 0.0,
         "group_score": float(member_means.mean()),
         "worst_member": float(member_means.min()),
         "fairness_gap": float(member_means.max() - member_means.min()),
+        # Secondary (per-restaurant) versions: aggregate within each listed
+        # restaurant first, then average over the list.
+        "worst_member_per_item": float(per_item.min(axis=0).mean()),
+        "fairness_gap_per_item": float((per_item.max(axis=0) - per_item.min(axis=0)).mean()),
     }
 
 
@@ -126,10 +147,14 @@ def evaluate_groups(
     seed: int = SEED,
     extra_taus: tuple[float, ...] = (),
     diagnostics: bool = False,
+    strategies: tuple[str, ...] = ALL_STRATEGIES,
+    lam: float = LAMBDA,
 ) -> tuple[pd.DataFrame, dict]:
     """One row per (surviving group, strategy). Returns (rows, drop counts).
 
     `model` needs business_ids, taste_vector_from() and scores_for().
+    `strategies` selects which strategies run (each strategy's output is
+    independent of which others run); `lam` is fairness's lambda.
 
     Sensitivity analysis only: `extra_taus` adds fairness_repeated runs as
     strategies named "fairness_repeated_tau<tau>". `diagnostics` adds
@@ -187,14 +212,17 @@ def evaluate_groups(
         for p in priors:
             np.subtract.at(counts, [index[b] for b in p.business_ids if b in index], 1)
 
-        rng = np.random.default_rng(_seed_for(g.group_id, seed))
-        tops = {
-            "random": cand[rng.permutation(len(cand))[:k]],
-            "popularity": cand[np.argsort(-counts[cand], kind="stable")[:k]],
-        }
+        tops = {}
+        if "random" in strategies:
+            rng = np.random.default_rng(_seed_for(g.group_id, seed))
+            tops["random"] = cand[rng.permutation(len(cand))[:k]]
+        if "popularity" in strategies:
+            tops["popularity"] = cand[np.argsort(-counts[cand], kind="stable")[:k]]
         diag = {}
-        for strategy in CONTENT_STRATEGIES:
-            if strategy == "fairness_repeated":
+        for strategy in [s for s in CONTENT_STRATEGIES if s in strategies]:
+            if strategy == "fairness":
+                tops[strategy] = AGGREGATORS[strategy](scores, excluded, k, norm=normalization, lam=lam)
+            elif strategy == "fairness_repeated":
                 picks, history, weights = fairness_repeated(
                     scores, excluded, k, norm=normalization, return_weights=True
                 )
@@ -242,10 +270,14 @@ def add_buckets(results: pd.DataFrame) -> pd.DataFrame:
     pop_bucket = pd.qcut(
         per_group["target_prior_reviews"].rank(method="first"), 3, labels=BUCKET_ORDER
     )
+    cohesion_tercile = pd.qcut(
+        per_group["cohesion"].rank(method="first"), 3, labels=TERCILE_ORDER
+    )
     buckets = pd.DataFrame(
         {
             "cohesion_bucket": pd.Categorical(cohesion_bucket, categories=BUCKET_ORDER, ordered=True),
             "popularity_bucket": pd.Categorical(pop_bucket, categories=BUCKET_ORDER, ordered=True),
+            "cohesion_tercile": pd.Categorical(cohesion_tercile, categories=TERCILE_ORDER, ordered=True),
         },
         index=per_group.index,
     )
@@ -434,6 +466,96 @@ def target_leak_flags(groups: pd.DataFrame, train_reviews: pd.DataFrame,
     return flags.reindex(groups["group_id"], fill_value=False)
 
 
+def lift_cost_table(results: pd.DataFrame, reference: str = "average",
+                    n_boot: int = N_BOOTSTRAP, seed: int = SEED) -> pd.DataFrame:
+    """Each strategy minus `reference`: hit@10 with a paired cluster-bootstrap
+    CI, and the mean paired differences of the predicted metrics (positive
+    worst-member = lift for the worst-off member; negative group score = cost)."""
+    hit = bootstrap_vs(results, reference, "hit", n_boot, seed)
+    out = pd.DataFrame(index=hit.index)
+    out["hit@10 diff"] = hit[f"hit_diff_vs_{reference}"]
+    out["hit@10 CI"] = [_fmt_ci(lo, hi) for lo, hi in zip(hit["ci_lo"], hit["ci_hi"])]
+    for metric in ("group_score", "worst_member", "fairness_gap"):
+        table = _per_group(results, metric)
+        out[f"{metric} diff (PREDICTED)"] = (table[out.index].sub(table[reference], axis=0)).mean()
+    return out
+
+
+def secondary_table(results: pd.DataFrame) -> pd.DataFrame:
+    """SECONDARY per-restaurant metrics by strategy, next to the primary
+    member-mean versions they differ from."""
+    grouped = _ordered_strategies(results).groupby("strategy", observed=True)
+    return grouped[["worst_member", "worst_member_per_item", "fairness_gap", "fairness_gap_per_item"]].mean()
+
+
+def tercile_table(results: pd.DataFrame) -> pd.DataFrame:
+    """Primary + secondary metrics for the bottom and top cohesion terciles
+    and for all groups (n per cell)."""
+    parts = [(t, results[results["cohesion_tercile"] == t]) for t in ("bottom", "top")] + [("all", results)]
+    tables = []
+    for label, part in parts:
+        table = summarize(part, ["strategy"])
+        table[list(SECONDARY_METRICS)] = (
+            _ordered_strategies(part).groupby("strategy", observed=True)[list(SECONDARY_METRICS)].mean()
+        )
+        tables.append(table.assign(cohesion_tercile=label).set_index("cohesion_tercile", append=True))
+    return pd.concat(tables).reorder_levels(["cohesion_tercile", "strategy"])
+
+
+def strategy_config(strategy: str, normalization: str, lam: float, sample: int | None) -> str:
+    parts = [f"norm={normalization}", f"k={K}", "groups: >=3 prior likes, <=10/user"]
+    if strategy == "fairness":
+        parts.append(f"lam={lam:g}")
+    if strategy == "fairness_repeated":
+        parts.append(f"tau={TAU:g}")
+    if sample is not None:
+        parts.append(f"sample={sample}")
+    return "; ".join(parts)
+
+
+def log_results(results: pd.DataFrame, split: str, note: str, configs: dict[str, str],
+                path: Path = GROUPS_RESULTS) -> int:
+    """Append one row per strategy (all surviving groups) to results/groups.md,
+    creating it with a header if missing. The only writer of that file."""
+    table = main_table_with_ci(results)
+    means = summarize(results, ["strategy"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        if new_file:
+            f.write(GROUPS_RESULTS_HEADER)
+        for strategy, row in table.iterrows():
+            m = means.loc[strategy]
+            f.write(
+                f"| {date.today().isoformat()} | {split} | {strategy} | {configs[strategy]} | {row['n']} "
+                f"| {row['hit@10']:.4f} {row['hit_ci']} | {row['ndcg@10']:.4f} | {m['group_score']:.4f} "
+                f"| {m['worst_member']:.4f} | {m['fairness_gap']:.4f} | {note} |\n"
+            )
+    return len(table)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", choices=["val", "test"], default="val")
+    parser.add_argument("--i-mean-it", action="store_true", help="required for --split test")
+    parser.add_argument("--sample", type=int, default=None, help="seeded sample of N groups")
+    parser.add_argument("--normalization", "--norm", choices=NORMS, default="rank",
+                        help="'raw' is the raw-cosine ablation")
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument("--strategy", choices=ALL_STRATEGIES, help="run only this strategy")
+    which.add_argument("--all", action="store_true", help="run every strategy (the default)")
+    parser.add_argument("--lam", type=float, default=LAMBDA, help="fairness lambda")
+    parser.add_argument("--log", metavar="NOTE", default=None,
+                        help=f"append one row per strategy to {GROUPS_RESULTS}")
+    parser.add_argument("--tau-sensitivity", action="store_true",
+                        help="sensitivity analysis of fairness_repeated's tau (separate CSV)")
+    return parser
+
+
+def selected_strategies(args) -> tuple[str, ...]:
+    return (args.strategy,) if args.strategy else ALL_STRATEGIES
+
+
 # --- fairness_repeated tau sensitivity (analysis only; tau = TAU is the
 # headline and the default; nothing here selects a tau) ----------------------
 
@@ -494,23 +616,43 @@ def tau_sensitivity(results: pd.DataFrame, taus=SENSITIVITY_TAUS,
                 rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} - average",
                              "value": d[f"{metric}_diff_vs_average"], "ci_lo": d["ci_lo"],
                              "ci_hi": d["ci_hi"], "n": n})
+    # SECONDARY per-restaurant metrics: level and difference vs average per
+    # tau, plus a paired default-tau vs tau=0.3 comparison.
+    for bucket in ("low", "high"):
+        part = results[results["cohesion_bucket"] == bucket]
+        n = part["group_id"].nunique()
+        for metric in SECONDARY_METRICS:
+            table = _per_group(part, metric)
+            clusters = _targets(part, table.index)
+            mdiffs = bootstrap_vs(part, "average", metric, n_boot, seed)
+            for tau in taus:
+                name = _repeated_name(tau)
+                lo, hi = cluster_bootstrap_ci(table[name].to_numpy(), clusters, n_boot, seed)
+                rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} (SECONDARY)",
+                             "value": table[name].mean(), "ci_lo": lo, "ci_hi": hi, "n": n})
+                d = mdiffs.loc[name]
+                rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} - average (SECONDARY)",
+                             "value": d[f"{metric}_diff_vs_average"], "ci_lo": d["ci_lo"],
+                             "ci_hi": d["ci_hi"], "n": n})
+            if TAU in taus and 0.3 in taus and TAU != 0.3:
+                d = bootstrap_vs(part, _repeated_name(0.3), metric, n_boot, seed).loc[_repeated_name(TAU)]
+                rows.append({"tau": TAU, "cohesion_bucket": bucket,
+                             "metric": f"{metric} - (tau=0.3) (SECONDARY)",
+                             "value": d[f"{metric}_diff_vs_{_repeated_name(0.3)}"], "ci_lo": d["ci_lo"],
+                             "ci_hi": d["ci_hi"], "n": n})
     table = pd.DataFrame(rows)
     table.insert(0, "analysis", "tau_sensitivity (not the headline; default tau=%g)" % TAU)
     return table
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--split", choices=["val", "test"], default="val")
-    parser.add_argument("--i-mean-it", action="store_true", help="required for --split test")
-    parser.add_argument("--sample", type=int, default=None, help="seeded sample of N groups")
-    parser.add_argument("--normalization", choices=NORMS, default="rank",
-                        help="'raw' is the raw-cosine ablation")
-    parser.add_argument("--tau-sensitivity", action="store_true",
-                        help="sensitivity analysis of fairness_repeated's tau (separate CSV)")
+    parser = build_parser()
     args = parser.parse_args()
     if args.split == "test" and not args.i_mean_it:
         parser.error("refusing to evaluate on the test split without --i-mean-it")
+    if args.tau_sensitivity and (args.strategy or args.log):
+        parser.error("--tau-sensitivity runs every strategy and never logs")
+    strategies = selected_strategies(args)
 
     groups = pd.read_parquet(GROUPS)
     groups = groups[groups["split"] == args.split]
@@ -524,7 +666,8 @@ if __name__ == "__main__":
 
     extra_taus = (*[t for t in SENSITIVITY_TAUS if t != TAU], 1e6) if args.tau_sensitivity else ()
     results, drops = evaluate_groups(groups, train, model, normalization=args.normalization,
-                                     extra_taus=extra_taus, diagnostics=args.tau_sensitivity)
+                                     extra_taus=extra_taus, diagnostics=args.tau_sensitivity,
+                                     strategies=strategies, lam=args.lam)
     n_survive = results["group_id"].nunique() if len(results) else 0
     print(f"{args.split} groups: {len(groups)}  surviving: {n_survive}")
     for reason, n in drops.items():
@@ -568,21 +711,29 @@ if __name__ == "__main__":
 
     n_targets = results["target_business_id"].nunique()
     boot = f"cluster bootstrap over {n_targets} targets, {N_BOOTSTRAP} resamples"
-    pd.set_option("display.width", 200)
-    print(f"\n== {args.split}, normalization={args.normalization}, k={K} ({boot}) ==")
+    compare = len(strategies) > 1 and "average" in strategies
+    pd.set_option("display.width", 220)
+    print(f"\n== {args.split}, normalization={args.normalization}, lam={args.lam:g}, k={K} ({boot}) ==")
     print(main_table_with_ci(results).round(4).to_string())
     print(summarize(results, ["strategy"]).round(4).to_string())
-    print(f"\n== hit@10 differences vs average ({boot}) ==")
-    print(bootstrap_vs(results).round(4).to_string())
-    print("\n== paired McNemar exact tests on hit@10 (ASSUME INDEPENDENT GROUPS; optimistic) ==")
-    print(paired_tests(results).round(4).to_string(index=False))
-    print(f"\n== mean top-{K} Jaccard overlap ==")
-    print(list_overlap(results).round(3).to_string())
+    if compare:
+        print(f"\n== lift/cost vs average: hit@10 ({boot}); predicted-metric differences ==")
+        print(lift_cost_table(results).round(4).to_string())
+        print("\n== paired McNemar exact tests on hit@10 (ASSUME INDEPENDENT GROUPS; optimistic) ==")
+        print(paired_tests(results).round(4).to_string(index=False))
+        print(f"\n== mean top-{K} Jaccard overlap ==")
+        print(list_overlap(results).round(3).to_string())
+    print("\n== SECONDARY metrics (per-restaurant min / max-min, averaged over the list), "
+          "next to the primary member-mean versions ==")
+    print(secondary_table(results).round(4).to_string())
     print("\n== by cohesion (split at median) ==")
     print(summarize(results, ["cohesion_bucket", "strategy"]).round(4).to_string())
-    print("\n== modeled-metric differences vs average by cohesion "
-          f"(cluster bootstrap by target within bucket, {N_BOOTSTRAP} resamples) ==")
-    print(modeled_diffs_by_cohesion(results).round(4).to_string())
+    print("\n== by cohesion tercile (bottom / top / all; includes SECONDARY columns) ==")
+    print(tercile_table(results).round(4).to_string())
+    if compare:
+        print("\n== modeled-metric differences vs average by cohesion "
+              f"(cluster bootstrap by target within bucket, {N_BOOTSTRAP} resamples) ==")
+        print(modeled_diffs_by_cohesion(results).round(4).to_string())
     print("\n== by target pre-window popularity (terciles) ==")
     print(summarize(results, ["popularity_bucket", "strategy"]).round(4).to_string())
 
@@ -601,9 +752,16 @@ if __name__ == "__main__":
     print(leak_by_popularity(results).round(4).to_string())
 
     suffix = "" if args.normalization == "rank" else f"_{args.normalization}"
+    suffix += f"_lam{args.lam:g}" if args.lam != LAMBDA else ""
+    suffix += f"_{args.strategy}" if args.strategy else ""
     suffix += f"_sample{args.sample}" if args.sample is not None else ""
     out = DATA / f"group_eval_{args.split}{suffix}.csv"
     lists_out = DATA / f"group_eval_{args.split}{suffix}_lists.parquet"
     results[["group_id", "strategy", "top_k"]].to_parquet(lists_out, index=False)
     results.drop(columns="top_k").to_csv(out, index=False)
     print(f"\nwrote {out}\nwrote {lists_out}")
+
+    if args.log is not None:
+        configs = {s: strategy_config(s, args.normalization, args.lam, args.sample) for s in strategies}
+        n = log_results(results, args.split, args.log, configs)
+        print(f"logged {n} rows to {GROUPS_RESULTS}")

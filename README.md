@@ -41,7 +41,7 @@ groups.parquet (src/groups.py, built from train_reviews only)
 
 ## Group evaluation
 
-Setup: synthetic co-rating groups of 3–4 users who each liked (≥ 4 stars) the same target restaurant within 30 days of each other (`src/groups.py`). Each member's profile is built only from their 4+ star train reviews dated strictly before the group's window start, with the target excluded; every member has at least 3 such prior likes, and no user is in more than 10 groups. Candidates are all restaurants minus anything a member reviewed before the window, and the target is always a candidate. The model is `ContentBasedCentered`; each member's scores are converted to rank percentiles over the candidate set before aggregation, so all metrics below are in terms of predicted satisfaction. Results are on the val group split only (n = 7,008 groups over 1,310 target restaurants, k = 10); 95% CIs are cluster bootstraps over targets (1,000 resamples; all groups for a sampled target are kept together). Source: `python -m src.group_eval` (`data/processed/group_eval_val.csv`).
+Setup: synthetic co-rating groups of 3–4 users who each liked (≥ 4 stars) the same target restaurant within 30 days of each other (`src/groups.py`). Each member's profile is built only from their 4+ star train reviews dated strictly before the group's window start, with the target excluded; every member has at least 3 such prior likes, and no user is in more than 10 groups. Candidates are all restaurants minus anything a member reviewed before the window, and the target is always a candidate. The model is `ContentBasedCentered`; each member's scores are converted to rank percentiles over the candidate set before aggregation, so all metrics below are in terms of predicted satisfaction. Results are on the val group split only (n = 7,008 groups over 1,310 target restaurants, k = 10); 95% CIs are cluster bootstraps over targets (1,000 resamples; all groups for a sampled target are kept together). Source: `python -m src.group_eval` (`data/processed/group_eval_val.csv`). fairness_repeated's top-10 is a sequence of 10 dinners, so its hit@10 means "the target came up within 10 dinners."
 
 | strategy | hits | hit@10 [95% CI] | NDCG@10 [95% CI] | group score | worst member | fairness gap |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -75,16 +75,31 @@ hit@10 by the target's pre-window review count (terciles):
 
 ### τ sensitivity (val, all values reported)
 
-fairness_repeated with each τ tested; differences vs. average with cluster-bootstrap 95% CIs (n = 7,008 overall, 3,504 per cohesion bucket). Source: `python -m src.group_eval --tau-sensitivity` (`data/processed/group_eval_val_tau_sensitivity.csv`).
+fairness_repeated with each τ tested; differences vs. average with cluster-bootstrap 95% CIs (n = 7,008 overall, 3,504 per cohesion bucket). Worst member and group score use the primary (member-mean) definitions; the "per restaurant" columns are the secondary per-dinner definitions (see "Per-dinner vs. cumulative fairness"). Source: `python -m src.group_eval --tau-sensitivity` (`data/processed/group_eval_val_tau_sensitivity.csv`).
 
-| τ | hit@10 − average | low cohesion: worst member − average | low cohesion: group score − average | high cohesion: worst member − average | high cohesion: group score − average |
-| --- | --- | --- | --- | --- | --- |
-| 0.1 (default) | −0.0021 [−0.0045, +0.0003] | +0.0074 [+0.0057, +0.0090] | −0.0496 [−0.0515, −0.0478] | +0.0160 [+0.0153, +0.0167] | −0.0082 [−0.0087, −0.0077] |
-| 0.3 | −0.0020 [−0.0042, +0.0000] | +0.0467 [+0.0453, +0.0482] | −0.0119 [−0.0124, −0.0115] | +0.0177 [+0.0168, +0.0186] | −0.0033 [−0.0035, −0.0031] |
-| 1.0 | −0.0016 [−0.0029, −0.0003] | +0.0386 [+0.0372, +0.0400] | −0.0047 [−0.0049, −0.0045] | +0.0120 [+0.0113, +0.0128] | −0.0011 [−0.0012, −0.0010] |
-| 3.0 | −0.0006 [−0.0015, +0.0003] | +0.0235 [+0.0225, +0.0246] | −0.0014 [−0.0014, −0.0013] | +0.0063 [+0.0059, +0.0068] | −0.0003 [−0.0003, −0.0002] |
+| τ | hit@10 − average | low cohesion: worst member − average | low cohesion: group score − average | low cohesion: per-restaurant worst member − average | low cohesion: per-restaurant fairness gap − average | high cohesion: worst member − average | high cohesion: group score − average | high cohesion: per-restaurant worst member − average | high cohesion: per-restaurant fairness gap − average |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.1 (default) | −0.0021 [−0.0045, +0.0003] | +0.0074 [+0.0057, +0.0090] | −0.0496 [−0.0515, −0.0478] | −0.1234 [−0.1278, −0.1190] | +0.1386 [+0.1335, +0.1436] | +0.0160 [+0.0153, +0.0167] | −0.0082 [−0.0087, −0.0077] | −0.0162 [−0.0174, −0.0150] | +0.0159 [+0.0146, +0.0172] |
+| 0.3 | −0.0020 [−0.0042, +0.0000] | +0.0467 [+0.0453, +0.0482] | −0.0119 [−0.0124, −0.0115] | −0.0155 [−0.0164, −0.0145] | +0.0105 [+0.0093, +0.0117] | +0.0177 [+0.0168, +0.0186] | −0.0033 [−0.0035, −0.0031] | −0.0006 [−0.0010, −0.0002] | −0.0019 [−0.0024, −0.0014] |
+| 1.0 | −0.0016 [−0.0029, −0.0003] | +0.0386 [+0.0372, +0.0400] | −0.0047 [−0.0049, −0.0045] | +0.0057 [+0.0051, +0.0064] | −0.0135 [−0.0145, −0.0125] | +0.0120 [+0.0113, +0.0128] | −0.0011 [−0.0012, −0.0010] | +0.0030 [+0.0027, +0.0034] | −0.0050 [−0.0055, −0.0045] |
+| 3.0 | −0.0006 [−0.0015, +0.0003] | +0.0235 [+0.0225, +0.0246] | −0.0014 [−0.0014, −0.0013] | +0.0083 [+0.0077, +0.0089] | −0.0131 [−0.0140, −0.0123] | +0.0063 [+0.0059, +0.0068] | −0.0003 [−0.0003, −0.0002] | +0.0025 [+0.0022, +0.0027] | −0.0035 [−0.0038, −0.0031] |
 
 τ=0.1 was fixed before any results. In low-cohesion groups it reduced the member gap about as much as τ=0.3 (and the most of any τ in high-cohesion groups), but mainly by lowering best-served members: its worst-member gain was the smallest of the four values tested. τ=0.3 gave the largest worst-member gain in low-cohesion groups. A possible cause, not verified, is that weights overcorrect as the worst-off member changes between dinners. Because the gap metric rewards leveling down, we treat worst-member predicted satisfaction as the primary fairness metric.
+
+### Per-dinner vs. cumulative fairness
+
+Worst member and fairness gap under both definitions (val, n = 7,008; predicted percentiles). Primary: each member's mean across the top-10 list, then the minimum / max − min over members. Secondary: the minimum / max − min over members for each restaurant, averaged over the list.
+
+| strategy | worst member (primary, member mean) | worst member (secondary, per restaurant) | fairness gap (primary, member mean) | fairness gap (secondary, per restaurant) |
+| --- | --- | --- | --- | --- |
+| average | 0.860 | 0.834 | 0.096 | 0.140 |
+| least_misery | 0.879 | 0.860 | 0.047 | 0.086 |
+| fairness | 0.879 | 0.858 | 0.049 | 0.087 |
+| fairness_repeated (τ=0.1) | 0.872 | 0.764 | 0.028 | 0.217 |
+
+fairness_repeated's per-restaurant fairness gap by cohesion tercile (2,336 groups each): 0.387 in the bottom (least cohesive) tercile vs. 0.078 in the top tercile; its member-mean gap is 0.039 and 0.017 respectively.
+
+The two definitions measure different things. Per-restaurant metrics ask whether each dinner works for everyone; member-mean metrics ask whether everyone is served equally across a sequence of dinners. fairness_repeated is designed for the second: it spreads its picks across members' tastes, so individual restaurants favor some members over others while the totals even out. It has the smallest cumulative gap and the largest per-dinner gap of the content strategies, and the difference grows as groups diverge. For a one-off dinner, least_misery is the better fit; for a group that eats together repeatedly, spreading picks across members is. τ=0.1 is not just more uneven across dinners; it is worse at each dinner. In low-cohesion groups its per-restaurant worst member is 0.645 [0.638, 0.652] vs. 0.753 [0.749, 0.757] at τ=0.3, and its per-restaurant fairness gap is 0.330 vs. 0.202 (paired difference +0.128 [0.123, 0.133], cluster bootstrap). From τ=0.3 upward, per-dinner metrics are close to or slightly better than average, so the per-dinner cost of sequential fairness comes mostly from setting τ too low.
 
 ### Pre-registered for test
 
