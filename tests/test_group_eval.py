@@ -1,0 +1,468 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+import src.recommend as recommend
+from src.group_eval import (
+    PreWindowPopularity,
+    add_buckets,
+    bootstrap_vs,
+    cluster_bootstrap_ci,
+    evaluate_groups,
+    leak_by_popularity,
+    modeled_diffs_by_cohesion,
+    list_overlap,
+    paired_tests,
+    summarize,
+    target_leak_flags,
+)
+from src.recommend import ContentBased, ContentBasedCentered
+
+
+# --- embed.py: --limit isolation and guard-before-save ---------------------
+# (Lives here because tests/test_embed.py isn't assigned to Person A in week 2.)
+
+
+@pytest.fixture
+def fake_embed(tmp_path, monkeypatch):
+    import src.embed as embed
+
+    ids = [f"b{i}" for i in range(4)]
+    reviews = pd.DataFrame(
+        [
+            {"review_id": f"{b}-{s}", "business_id": b, "stars": s, "text": "x" * 300}
+            for b in ids
+            for s in (5, 2)
+        ]
+    )
+    restaurants = pd.DataFrame({"name": ids, "categories": "Food"}, index=pd.Index(ids, name="business_id"))
+
+    class FakeModel:
+        def __init__(self, name):
+            pass
+
+        def encode(self, texts, **kwargs):
+            return np.ones((len(texts), 3), dtype="float32")
+
+    monkeypatch.setattr(embed, "_load_eligible_reviews", lambda: (reviews, restaurants, list(ids)))
+    monkeypatch.setattr(embed, "SentenceTransformer", FakeModel)
+    for name in ("EMBEDDINGS", "EMBEDDINGS_BLOB", "BUSINESS_IDS"):
+        suffix = ".txt" if name == "BUSINESS_IDS" else ".npy"
+        monkeypatch.setattr(embed, name, tmp_path / (name.lower() + suffix))
+    return embed, ids
+
+
+@pytest.mark.parametrize("mode", ["chunked", "blob"])
+def test_limit_run_never_touches_real_outputs(fake_embed, mode):
+    embed, ids = fake_embed
+    real = [embed.EMBEDDINGS, embed.EMBEDDINGS_BLOB, embed.BUSINESS_IDS]
+    run = embed.run_chunked if mode == "chunked" else embed.run_blob
+
+    run(limit=2)
+
+    assert not any(p.exists() for p in real)
+    emb_path, ids_path = embed._output_paths(
+        embed.EMBEDDINGS if mode == "chunked" else embed.EMBEDDINGS_BLOB, 2
+    )
+    assert emb_path.name.endswith("_limit2.npy") and ids_path.name.endswith("_limit2.txt")
+    assert np.load(emb_path).shape == (2, 3)
+    assert ids_path.read_text().split() == ids[:2]
+
+
+def test_guard_fails_before_any_npy_is_saved(fake_embed):
+    embed, ids = fake_embed
+    embed.BUSINESS_IDS.write_text("\n".join(reversed(ids)) + "\n")
+
+    with pytest.raises(ValueError, match="ordering would change"):
+        embed.run_chunked()
+
+    assert not embed.EMBEDDINGS.exists()
+    assert embed.BUSINESS_IDS.read_text().split() == list(reversed(ids))
+
+
+def test_full_run_writes_real_outputs(fake_embed):
+    embed, ids = fake_embed
+    embed.run_chunked()
+    assert np.load(embed.EMBEDDINGS).shape == (4, 3)
+    assert embed.BUSINESS_IDS.read_text().split() == ids
+
+
+# --- ContentBased.taste_vector_from / scores_for --------------------------
+# (Lives here because tests/test_recommend.py isn't assigned to Person A in week 2.)
+
+TINY_IDS = ["r0", "r1", "r2", "r3"]
+TINY = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.6, 0.8, 0.0],
+        [0.0, 0.6, 0.8],
+    ],
+    dtype="float32",
+)
+
+
+@pytest.fixture
+def tiny_embeddings(monkeypatch):
+    monkeypatch.setattr(recommend, "load_embeddings", lambda path: (TINY.copy(), list(TINY_IDS)))
+
+
+def test_taste_vector_skips_unknown_ids(tiny_embeddings):
+    model = ContentBased()
+    np.testing.assert_allclose(
+        model.taste_vector_from(["r0", "nope", "r1"]), model.taste_vector_from(["r0", "r1"])
+    )
+
+
+def test_taste_vector_none_when_nothing_known(tiny_embeddings):
+    model = ContentBased()
+    assert model.taste_vector_from([]) is None
+    assert model.taste_vector_from(["nope", "also-nope"]) is None
+
+
+def test_taste_vector_is_unit_norm_mean(tiny_embeddings):
+    model = ContentBased()
+    taste = model.taste_vector_from(["r0", "r1"])
+    np.testing.assert_allclose(np.linalg.norm(taste), 1.0, rtol=1e-6)
+    np.testing.assert_allclose(taste, np.array([1, 1, 0]) / np.sqrt(2), rtol=1e-6)
+
+
+def test_centered_model_uses_centered_matrix(tiny_embeddings):
+    model = ContentBasedCentered()
+    centered = TINY - TINY.mean(axis=0)
+    centered /= np.linalg.norm(centered, axis=1, keepdims=True)
+    np.testing.assert_allclose(model.matrix, centered, rtol=1e-6)
+
+    expected = centered[[0, 2]].mean(axis=0)
+    expected /= np.linalg.norm(expected)
+    np.testing.assert_allclose(model.taste_vector_from(["r0", "r2"]), expected, rtol=1e-5)
+    # and differs from the uncentered model's vector
+    assert not np.allclose(model.taste_vector_from(["r0", "r2"]), ContentBased().taste_vector_from(["r0", "r2"]))
+
+
+def test_scores_for_follows_business_ids_order(tiny_embeddings):
+    for model in (ContentBased(), ContentBasedCentered()):
+        taste = model.taste_vector_from(["r3"])
+        scores = model.scores_for(taste)
+        assert scores.shape == (len(TINY_IDS),)
+        for i, b in enumerate(model.business_ids):
+            assert b == TINY_IDS[i]
+            np.testing.assert_allclose(scores[i], model.matrix[model.index[b]] @ taste, rtol=1e-6)
+        assert int(np.argmax(scores)) == TINY_IDS.index("r3")
+
+
+T0 = pd.Timestamp("2020-01-01")
+WINDOW_START = T0 + pd.Timedelta(days=100)
+BUSINESSES = ["bt", "b0", "b1", "b2", "b3", "b4", "b5", "bpop_before", "bpop_after"]
+
+
+def _day(d):
+    return T0 + pd.Timedelta(days=d)
+
+
+def _review(user_id, business_id, day, stars=5):
+    return {"user_id": user_id, "business_id": business_id, "stars": stars, "date": _day(day)}
+
+
+class RecordingModel(ContentBased):
+    """ContentBased over a tiny in-memory matrix; records every history
+    passed to taste_vector_from."""
+
+    def __init__(self):
+        rng = np.random.default_rng(0)
+        m = rng.normal(size=(len(BUSINESSES), 8))
+        self.matrix = m / np.linalg.norm(m, axis=1, keepdims=True)
+        self.business_ids = list(BUSINESSES)
+        self.index = {b: i for i, b in enumerate(self.business_ids)}
+        self.name = "recording"
+        self.profiles = []
+
+    def taste_vector_from(self, business_ids):
+        self.profiles.append(list(business_ids))
+        return super().taste_vector_from(business_ids)
+
+
+def _build_train():
+    rows = []
+    for u in ["u1", "u2", "u3"]:
+        # three pre-window likes each (enough history)
+        rows += [_review(u, "b0", 10), _review(u, "b1", 20), _review(u, "b2", 30)]
+        # liked the target inside the window (how groups.py found them)
+        rows.append(_review(u, "bt", 105))
+    # u1: a 5-star review exactly at window_start and one after it -> neither
+    # may enter u1's profile or be excluded from candidates.
+    rows.append(_review("u1", "b4", 100))
+    rows.append(_review("u1", "b5", 150))
+    # u1 also disliked b3 before the window -> not in profile, but excluded.
+    rows.append(_review("u1", "b3", 40, stars=2))
+
+    # u4: only two pre-window likes -> any group with u4 is dropped.
+    rows += [_review("u4", "b0", 10), _review("u4", "b1", 20), _review("u4", "bt", 101)]
+    # u5: enough likes, but rated the target 2 stars before the window.
+    rows += [_review("u5", b, d) for b, d in [("b0", 10), ("b1", 20), ("b2", 30)]]
+    rows += [_review("u5", "bt", 50, stars=2), _review("u5", "bt", 102)]
+
+    # Non-members: bpop_before has 2 pre-window reviews, bpop_after has 5
+    # post-window ones; the target has 1 before and 4 after.
+    rows += [_review(f"x{i}", "bpop_before", 60 + i) for i in range(2)]
+    rows += [_review(f"y{i}", "bpop_after", 120 + i) for i in range(5)]
+    rows += [_review("z0", "bt", 70)] + [_review(f"z{i}", "bt", 110 + i) for i in range(1, 5)]
+    return pd.DataFrame(rows)
+
+
+def _group(group_id, members):
+    return {
+        "group_id": group_id,
+        "members": members,
+        "target_business_id": "bt",
+        "window_start": WINDOW_START,
+        "size": len(members),
+        "split": "val",
+    }
+
+
+def _run(groups, train=None, model=None):
+    model = model or RecordingModel()
+    train = _build_train() if train is None else train
+    results, drops = evaluate_groups(pd.DataFrame(groups), train, model)
+    return results, drops, model
+
+
+def test_only_strictly_pre_window_likes_enter_profiles():
+    results, drops, model = _run([_group("g_ok", ["u1", "u2", "u3"])])
+    assert results["group_id"].unique().tolist() == ["g_ok"]
+    assert len(model.profiles) == 3
+    for profile in model.profiles:
+        assert sorted(profile) == ["b0", "b1", "b2"]  # no b4 (at T), b5 (after), b3 (2 stars), bt
+
+
+def test_target_excluded_from_profile_but_kept_as_candidate():
+    results, _, model = _run([_group("g_ok", ["u1", "u2", "u3"])])
+    assert all("bt" not in p for p in model.profiles)
+    # Excluded: only the pre-window reviewed b0, b1, b2, b3. bt, b4 and b5 stay.
+    assert (results["n_candidates"] == len(BUSINESSES) - 4).all()
+
+    # If the target's embedding equals the members' shared taste, the
+    # content strategies must rank it first -- so it really is a candidate.
+    model = RecordingModel()
+    taste = model.matrix[[model.index[b] for b in ["b0", "b1", "b2"]]].mean(axis=0)
+    model.matrix[model.index["bt"]] = taste / np.linalg.norm(taste)
+    results, _, _ = _run([_group("g_ok", ["u1", "u2", "u3"])], model=model)
+    content = results[
+        results["strategy"].isin(["average", "least_misery", "fairness", "fairness_repeated"])
+    ]
+    assert (content["hit"] == 1).all()
+    assert (content["ndcg"] == 1).all()
+
+
+def test_groups_failing_filters_are_dropped():
+    results, drops, _ = _run(
+        [
+            _group("g_ok", ["u1", "u2", "u3"]),
+            _group("g_short", ["u1", "u2", "u4"]),
+            _group("g_seen", ["u1", "u2", "u5"]),
+        ]
+    )
+    assert set(results["group_id"]) == {"g_ok"}
+    assert drops["too_few_prior_likes"] == 1
+    assert drops["target_in_prior_history"] == 1
+
+
+def test_popularity_uses_only_pre_window_counts():
+    train = _build_train()
+    pop = PreWindowPopularity(train, BUSINESSES)
+    counts = dict(zip(BUSINESSES, pop.counts(WINDOW_START)))
+    assert counts["bpop_after"] == 0
+    assert counts["bpop_before"] == 2
+    # bt: z0 (day 70) and u5's 2-star review (day 50); in-window ones excluded.
+    assert counts["bt"] == 2
+
+    results, _, _ = _run([_group("g_ok", ["u1", "u2", "u3"])], train=train)
+    assert (results["target_prior_reviews"] == 2).all()
+
+
+def test_popularity_strategy_ranks_by_pre_window_counts():
+    # Pre-window, bt and bpop_before tie at 2 and bt comes first in catalog
+    # order; bpop_after (5 reviews, all post-window) must not outrank it.
+    results, _, _ = _run([_group("g_ok", ["u1", "u2", "u3"])])
+    pop = results[results["strategy"] == "popularity"].iloc[0]
+    assert pop["hit"] == 1 and pop["ndcg"] == 1
+
+
+def test_member_percentile_metrics_are_consistent():
+    results, _, _ = _run([_group("g_ok", ["u1", "u2", "u3"])])
+    for r in results.itertuples():
+        assert 0 <= r.worst_member <= r.group_score <= 1
+        assert r.fairness_gap >= 0
+    assert set(results["strategy"]) == {
+        "random", "popularity", "average", "least_misery", "fairness", "fairness_repeated"
+    }
+
+
+@pytest.mark.parametrize("bad", ["u4", "u5"])
+def test_no_survivors_returns_empty(bad):
+    results, drops, _ = _run([_group("g", ["u1", "u2", bad])])
+    assert results.empty
+    assert sum(drops.values()) >= 1
+
+
+# --- paired statistics, overlap, buckets, leak flags ----------------------
+
+
+def _fake_results(hits, lists=None, targets=None):
+    """hits: {strategy: [0/1 per group]}; targets: target per group
+    (default: every group its own target)."""
+    rows = []
+    for s, hs in hits.items():
+        for g, h in enumerate(hs):
+            rows.append(
+                {
+                    "group_id": f"g{g}",
+                    "target_business_id": targets[g] if targets else f"t{g}",
+                    "strategy": s,
+                    "hit": float(h),
+                    "ndcg": float(h),
+                    "top_k": (lists or {}).get(s, [["x"]] * len(hs))[g],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_paired_tests_counts_discordant_pairs():
+    res = _fake_results({"average": [1, 1, 1, 0, 0], "least_misery": [1, 0, 0, 0, 1]})
+    row = paired_tests(res).iloc[0]
+    assert (row["a"], row["b"]) == ("average", "least_misery")
+    assert (row["a_hit_b_miss"], row["a_miss_b_hit"]) == (2, 1)
+    assert row["p_mcnemar_indep"] == pytest.approx(1.0)
+
+
+def test_paired_tests_no_discordance_gives_p_one():
+    res = _fake_results({"average": [1, 0, 0], "fairness": [1, 0, 0]})
+    assert paired_tests(res).iloc[0]["p_mcnemar_indep"] == 1.0
+
+
+def test_bootstrap_vs_average_is_paired_and_seeded():
+    res = _fake_results({"average": [1] * 30 + [0] * 70, "random": [0] * 100})
+    a, b = bootstrap_vs(res), bootstrap_vs(res)
+    pd.testing.assert_frame_equal(a, b)
+    row = a.loc["random"]
+    assert row["hit_diff_vs_average"] == pytest.approx(-0.3)
+    assert row["ci_hi"] < 0 and row["ci_excludes_0"]
+
+
+def test_cluster_bootstrap_keeps_targets_together():
+    # One target -> every resample is the whole data -> zero-width CI.
+    lo, hi = cluster_bootstrap_ci(np.array([1, 0, 0, 1.0]), np.array(["t"] * 4))
+    assert lo == hi == pytest.approx(0.5)
+
+    # Two targets, each internally homogeneous: resample means can only be
+    # 0, 0.5 or 1 (whole clusters), never e.g. 0.25 as with group resampling.
+    values = np.array([1.0] * 10 + [0.0] * 10)
+    clusters = np.array(["a"] * 10 + ["b"] * 10)
+    lo, hi = cluster_bootstrap_ci(values, clusters)
+    assert lo in (0.0, 0.5, 1.0) and hi in (0.0, 0.5, 1.0)
+    assert (lo, hi) == (0.0, 1.0)
+
+
+def test_cluster_ci_wider_than_iid_when_targets_correlate():
+    # 20 targets x 10 groups, hits perfectly correlated within target.
+    targets = [f"t{i // 10}" for i in range(200)]
+    hits = [1 if i // 10 < 4 else 0 for i in range(200)]
+    clustered = bootstrap_vs(
+        _fake_results({"average": [0] * 200, "popularity": hits}, targets=targets)
+    ).loc["popularity"]
+    iid = bootstrap_vs(_fake_results({"average": [0] * 200, "popularity": hits})).loc["popularity"]
+    assert clustered["ci_hi"] - clustered["ci_lo"] > 2 * (iid["ci_hi"] - iid["ci_lo"])
+
+
+def test_list_overlap_jaccard():
+    res = _fake_results(
+        {"average": [0, 0], "fairness": [0, 0]},
+        lists={"average": [["a", "b"], ["a", "b"]], "fairness": [["a", "b"], ["c", "d"]]},
+    )
+    overlap = list_overlap(res)
+    assert overlap.loc["average", "fairness"] == pytest.approx(0.5)
+    assert overlap.loc["average", "average"] == 1.0
+
+
+def test_bucket_tables_print_low_mid_high():
+    rows = []
+    for g in range(9):
+        for s in ["random", "average"]:
+            rows.append({"group_id": f"g{g}", "strategy": s, "cohesion": g / 10,
+                         "target_prior_reviews": 100 - g, "hit": 0.0, "ndcg": 0.0,
+                         "group_score": 0.5, "worst_member": 0.5, "fairness_gap": 0.0})
+    table = summarize(add_buckets(pd.DataFrame(rows)), ["popularity_bucket", "strategy"])
+    assert list(table.index) == [(b, s) for b in ["low", "mid", "high"] for s in ["random", "average"]]
+    assert (table["n"] == 3).all()
+
+
+def test_target_leak_flags():
+    groups = pd.DataFrame(
+        [
+            {"group_id": "leaky", "members": ["u1", "u2"], "target_business_id": "t"},
+            {"group_id": "clean", "members": ["u3", "u4"], "target_business_id": "t"},
+            {"group_id": "no_reviews", "members": ["u5"], "target_business_id": "s"},
+        ]
+    )
+    train = pd.DataFrame(
+        [
+            {"review_id": "r1", "user_id": "u1", "business_id": "t"},
+            {"review_id": "r2", "user_id": "u2", "business_id": "t"},
+            {"review_id": "r3", "user_id": "u3", "business_id": "t"},
+            {"review_id": "r9", "user_id": "u4", "business_id": "other"},
+        ]
+    )
+    embedded = {"t": {"r2", "r_someone_else"}, "other": {"r9"}}
+    flags = target_leak_flags(groups, train, embedded)
+    assert flags.to_dict() == {"leaky": True, "clean": False, "no_reviews": False}
+
+
+def _bucketed_results():
+    rows = []
+    for g in range(12):
+        for s, hit, score in [("average", g % 2, 0.9), ("least_misery", 0, 0.8), ("fairness", 0, 0.85)]:
+            rows.append({"group_id": f"g{g}", "target_business_id": f"t{g % 4}", "strategy": s,
+                         "hit": float(hit), "ndcg": float(hit), "group_score": score,
+                         "worst_member": score - 0.1, "fairness_gap": 0.1,
+                         "popularity_bucket": "low" if g < 6 else "mid",
+                         "cohesion_bucket": "low" if g % 3 else "high",
+                         "target_leak": g % 4 == 0})
+    return pd.DataFrame(rows)
+
+
+def test_leak_by_popularity_splits_bucket_and_flag():
+    table = leak_by_popularity(_bucketed_results())
+    assert set(table.index.get_level_values("popularity_bucket")) == {"low", "mid"}
+    low_flagged = table.loc[("low", "average", True)]
+    # low bucket = g0..g5; flagged (g % 4 == 0) = g0, g4, both even -> no average hits
+    assert low_flagged["n"] == 2 and low_flagged["hit@10"] == 0.0
+    assert table.loc[("low", "average", False)]["n"] == 4
+
+
+def test_modeled_diffs_by_cohesion():
+    table = modeled_diffs_by_cohesion(_bucketed_results())
+    row = table.loc[("high", "group_score", "least_misery - average")]
+    assert row["value"] == pytest.approx(-0.1)
+    assert row["ci_excludes_0"]
+    assert table.loc[("low", "fairness_gap", "fairness - average")]["value"] == pytest.approx(0.0)
+
+
+def test_repeated_diagnostics():
+    from src.aggregate import fairness_repeated, normalize
+    from src.group_eval import _repeated_diagnostics
+
+    # Two like-minded members and one opposite: after dinner 1 the opposite
+    # member is lowest and, at tau=0.1, effectively dictates dinner 2.
+    rng = np.random.default_rng(6)
+    base = rng.normal(size=50)
+    scores = np.stack([base, base + 0.01 * rng.normal(size=50), -base])
+    excluded = np.zeros(50, dtype=bool)
+    picks, history, weights = fairness_repeated(scores, excluded, 5, return_weights=True)
+    d = _repeated_diagnostics(picks, history, weights, normalize(scores, excluded), excluded)
+    assert len(d["fr_max_weight"]) == 5
+    assert d["fr_max_weight"][0] == pytest.approx(1 / 3)
+    assert d["fr_top_is_lowest"][0] is None  # all totals tied at dinner 1
+    untied = [x for x in d["fr_top_is_lowest"][1:] if x is not None]
+    assert untied and all(untied)  # softmax(-cum/tau): true by construction
+    assert d["fr_max_weight"][1] > 0.9 and d["fr_dictator"][1]

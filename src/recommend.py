@@ -75,6 +75,23 @@ class ContentBased:
             for b in business_ids
         ]
 
+    def taste_vector_from(self, business_ids: list[str]) -> np.ndarray | None:
+        """L2-normalized mean embedding of an arbitrary history (e.g. a
+        member's pre-window likes), skipping unknown IDs. None if no ID is
+        known or the mean is the zero vector.
+        """
+        idxs = [self.index[b] for b in business_ids if b in self.index]
+        if not idxs:
+            return None
+        vec = self.matrix[idxs].mean(axis=0)
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else None
+
+    def scores_for(self, taste: np.ndarray) -> np.ndarray:
+        """Cosine of `taste` against every restaurant, in business_ids.txt
+        order (rows of self.matrix are unit-norm)."""
+        return self.matrix @ taste
+
 
 class ContentBasedBlob(ContentBased):
     def __init__(self, embeddings_path=EMBEDDINGS_BLOB, name="content_blob"):

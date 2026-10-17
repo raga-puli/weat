@@ -23,8 +23,8 @@ MAX_PER_SIDE = 15
 MIN_ELIGIBLE = 5
 
 
-def _select_side(df, mode, cap=MAX_PER_SIDE, seed=SEED):
-    """Map business_id -> up to `cap` review texts, longest-first.
+def _select_rows(df, mode, cap=MAX_PER_SIDE, seed=SEED):
+    """Map business_id -> up to `cap` selected review rows, longest-first.
 
     blob mode always takes the `cap` longest reviews (deterministic,
     matches the original ablation). chunked mode takes a seeded
@@ -42,10 +42,34 @@ def _select_side(df, mode, cap=MAX_PER_SIDE, seed=SEED):
                 group = group.sample(n=cap, random_state=seed)
             else:
                 group = group.nlargest(cap, "_len")
-        selected[business_id] = group.sort_values("_len", ascending=False)[
-            "text"
-        ].tolist()
+        selected[business_id] = group.sort_values("_len", ascending=False)
     return selected
+
+
+def _select_side(df, mode, cap=MAX_PER_SIDE, seed=SEED):
+    """Map business_id -> up to `cap` review texts, longest-first."""
+    return {
+        business_id: rows["text"].tolist()
+        for business_id, rows in _select_rows(df, mode, cap, seed).items()
+    }
+
+
+def embedded_review_ids(mode="chunked"):
+    """business_id -> set of review_ids whose text went into that
+    restaurant's embedding, reproducing run_chunked / run_blob's selection
+    exactly (same eligibility, per-side cap and SEED) without encoding.
+    """
+    reviews, _, business_ids = _load_eligible_reviews()
+    keep = set(business_ids)
+    out = {}
+    for side in (
+        reviews[reviews["stars"] >= RELEVANT_MIN_STARS],
+        reviews[reviews["stars"] < RELEVANT_MIN_STARS],
+    ):
+        for business_id, rows in _select_rows(side, mode).items():
+            if business_id in keep:
+                out.setdefault(business_id, set()).update(rows["review_id"])
+    return out
 
 
 def _load_eligible_reviews():
@@ -63,9 +87,27 @@ def _load_eligible_reviews():
     return reviews, restaurants, business_ids
 
 
-def _write_business_ids(business_ids):
-    if BUSINESS_IDS.exists():
-        with open(BUSINESS_IDS) as f:
+def _output_paths(embeddings_path, limit):
+    """(embeddings, business_ids) paths. A --limit run never touches the
+    real files: it writes e.g. embeddings_limit50.npy + business_ids_limit50.txt."""
+    if limit is None:
+        return embeddings_path, BUSINESS_IDS
+    return (
+        embeddings_path.with_name(f"{embeddings_path.stem}_limit{limit}.npy"),
+        BUSINESS_IDS.with_name(f"{BUSINESS_IDS.stem}_limit{limit}.txt"),
+    )
+
+
+def _write_business_ids(business_ids, path=None):
+    _check_business_ids(business_ids, path)
+    with open(path or BUSINESS_IDS, "w") as f:
+        f.write("\n".join(business_ids) + "\n")
+
+
+def _check_business_ids(business_ids, path=None):
+    path = path or BUSINESS_IDS
+    if path.exists():
+        with open(path) as f:
             existing = [line.strip() for line in f if line.strip()]
         if existing != business_ids:
             first_diff = next(
@@ -82,19 +124,19 @@ def _write_business_ids(business_ids):
                 else "<missing>"
             )
             raise ValueError(
-                f"business_ids.txt ordering would change at index {first_diff}: "
+                f"{path.name} ordering would change at index {first_diff}: "
                 f"existing={old!r} new={new!r}. Refusing to overwrite; the two "
                 f"embedding files would no longer share one consistent row order."
             )
-
-    with open(BUSINESS_IDS, "w") as f:
-        f.write("\n".join(business_ids) + "\n")
 
 
 def run_blob(limit=None):
     reviews, restaurants, business_ids = _load_eligible_reviews()
     if limit is not None:
         business_ids = business_ids[:limit]
+    emb_path, ids_path = _output_paths(EMBEDDINGS_BLOB, limit)
+    # Fail before the (slow) encode and before any .npy is written.
+    _check_business_ids(business_ids, ids_path)
 
     pos = reviews[reviews["stars"] >= RELEVANT_MIN_STARS]
     neg = reviews[reviews["stars"] < RELEVANT_MIN_STARS]
@@ -113,15 +155,19 @@ def run_blob(limit=None):
         texts, batch_size=64, show_progress_bar=True, normalize_embeddings=True
     ).astype("float32")
 
-    np.save(EMBEDDINGS_BLOB, emb)
-    _write_business_ids(business_ids)
-    print(f"{EMBEDDINGS_BLOB}: {emb.shape} {emb.dtype}")
+    _check_business_ids(business_ids, ids_path)
+    np.save(emb_path, emb)
+    _write_business_ids(business_ids, ids_path)
+    print(f"{emb_path}: {emb.shape} {emb.dtype}")
 
 
 def run_chunked(limit=None):
     reviews, restaurants, business_ids = _load_eligible_reviews()
     if limit is not None:
         business_ids = business_ids[:limit]
+    emb_path, ids_path = _output_paths(EMBEDDINGS, limit)
+    # Fail before the (slow) encode and before any .npy is written.
+    _check_business_ids(business_ids, ids_path)
 
     pos = reviews[reviews["stars"] >= RELEVANT_MIN_STARS]
     neg = reviews[reviews["stars"] < RELEVANT_MIN_STARS]
@@ -157,9 +203,10 @@ def run_chunked(limit=None):
         norm = np.linalg.norm(vec)
         final[row] = vec / norm if norm > 0 else vec
 
-    np.save(EMBEDDINGS, final)
-    _write_business_ids(business_ids)
-    print(f"{EMBEDDINGS}: {final.shape} {final.dtype}")
+    _check_business_ids(business_ids, ids_path)
+    np.save(emb_path, final)
+    _write_business_ids(business_ids, ids_path)
+    print(f"{emb_path}: {final.shape} {final.dtype}")
 
 
 def print_neighbors(name, mode, k=10):

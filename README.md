@@ -29,6 +29,84 @@ reviews.parquet
 embeddings.npy    -> (n_restaurants, 384) float32
 business_ids.txt  -> one business_id per line, same order as embeddings
 
+groups.parquet (src/groups.py, built from train_reviews only)
+  group_id (str): 12-char content hash of members + target
+  members (list[str]): 3-4 distinct user_ids, all from the val split, sorted; each has >= 3 train
+    reviews with >= 4 stars dated strictly before window_start; no user is in more than 10 groups
+  target_business_id (str): held-out restaurant every member rated >= 4 stars within the window
+    (at most 20 groups per target)
+  window_start (timestamp): earliest member's review of the target; all members' reviews fall within 30 days of it
+  size (int): number of members (3 or 4)
+  split (str): "val" or "test", 70/30, deterministic from SEED + group_id
+
+## Group evaluation
+
+Setup: synthetic co-rating groups of 3–4 users who each liked (≥ 4 stars) the same target restaurant within 30 days of each other (`src/groups.py`). Each member's profile is built only from their 4+ star train reviews dated strictly before the group's window start, with the target excluded; every member has at least 3 such prior likes, and no user is in more than 10 groups. Candidates are all restaurants minus anything a member reviewed before the window, and the target is always a candidate. The model is `ContentBasedCentered`; each member's scores are converted to rank percentiles over the candidate set before aggregation, so all metrics below are in terms of predicted satisfaction. Results are on the val group split only (n = 7,008 groups over 1,310 target restaurants, k = 10); 95% CIs are cluster bootstraps over targets (1,000 resamples; all groups for a sampled target are kept together). Source: `python -m src.group_eval` (`data/processed/group_eval_val.csv`).
+
+| strategy | hits | hit@10 [95% CI] | NDCG@10 [95% CI] | group score | worst member | fairness gap |
+| --- | --- | --- | --- | --- | --- | --- |
+| random | 14 | 0.0020 [0.0010, 0.0032] | 0.0008 [0.0004, 0.0013] | 0.499 | 0.428 | 0.141 |
+| popularity | 190 | 0.0271 [0.0159, 0.0400] | 0.0120 [0.0062, 0.0186] | 0.579 | 0.484 | 0.186 |
+| average | 134 | 0.0191 [0.0154, 0.0235] | 0.0094 [0.0073, 0.0120] | 0.914 | 0.860 | 0.096 |
+| least_misery | 112 | 0.0160 [0.0122, 0.0198] | 0.0079 [0.0059, 0.0100] | 0.901 | 0.879 | 0.047 |
+| fairness | 114 | 0.0163 [0.0125, 0.0200] | 0.0081 [0.0061, 0.0102] | 0.904 | 0.879 | 0.049 |
+| fairness_repeated (τ=0.1) | 119 | 0.0170 [0.0130, 0.0213] | 0.0086 [0.0065, 0.0111] | 0.885 | 0.872 | 0.028 |
+
+Group score (mean over the list of the members' mean predicted percentile), worst member (lowest member's mean predicted percentile across the list), and fairness gap (highest minus lowest member mean) use the same predicted percentiles the content strategies optimize, so they compare content strategies with each other; only hit@10 and NDCG@10 are external measures. On hit@10 vs. average (cluster bootstrap), least_misery (−0.0031 [−0.0053, −0.0009]) and fairness (−0.0029 [−0.0049, −0.0009]) are lower; popularity (+0.0080 [−0.0040, +0.0217]) and fairness_repeated (−0.0021 [−0.0045, +0.0003]) are not distinguishable from average.
+
+Modeled-metric differences vs. average by group cohesion (mean pairwise cosine of member taste vectors, split at the val median):
+
+| cohesion | strategy − average | group score [95% CI] | worst member [95% CI] | fairness gap [95% CI] |
+| --- | --- | --- | --- | --- |
+| low (n=3504) | least_misery | −0.0179 [−0.0184, −0.0175] | +0.0279 [0.0265, 0.0293] | −0.0731 [−0.0755, −0.0707] |
+| low (n=3504) | fairness | −0.0153 [−0.0156, −0.0149] | +0.0277 [0.0264, 0.0291] | −0.0719 [−0.0744, −0.0696] |
+| low (n=3504) | fairness_repeated (τ=0.1) | −0.0496 [−0.0515, −0.0478] | +0.0074 [0.0057, 0.0090] | −0.0980 [−0.1005, −0.0954] |
+| high (n=3504) | least_misery | −0.0071 [−0.0074, −0.0068] | +0.0101 [0.0095, 0.0109] | −0.0258 [−0.0270, −0.0246] |
+| high (n=3504) | fairness | −0.0050 [−0.0052, −0.0048] | +0.0101 [0.0095, 0.0108] | −0.0235 [−0.0247, −0.0224] |
+| high (n=3504) | fairness_repeated (τ=0.1) | −0.0082 [−0.0087, −0.0077] | +0.0160 [0.0153, 0.0167] | −0.0382 [−0.0399, −0.0367] |
+
+hit@10 by the target's pre-window review count (terciles):
+
+| target popularity | n | random | popularity | average | least_misery | fairness | fairness_repeated |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| low | 2336 | 0.0021 | 0.0021 | 0.0231 | 0.0214 | 0.0210 | 0.0188 |
+| mid | 2336 | 0.0021 | 0.0060 | 0.0188 | 0.0141 | 0.0154 | 0.0150 |
+| high | 2336 | 0.0017 | 0.0732 | 0.0154 | 0.0124 | 0.0124 | 0.0171 |
+
+### τ sensitivity (val, all values reported)
+
+fairness_repeated with each τ tested; differences vs. average with cluster-bootstrap 95% CIs (n = 7,008 overall, 3,504 per cohesion bucket). Source: `python -m src.group_eval --tau-sensitivity` (`data/processed/group_eval_val_tau_sensitivity.csv`).
+
+| τ | hit@10 − average | low cohesion: worst member − average | low cohesion: group score − average | high cohesion: worst member − average | high cohesion: group score − average |
+| --- | --- | --- | --- | --- | --- |
+| 0.1 (default) | −0.0021 [−0.0045, +0.0003] | +0.0074 [+0.0057, +0.0090] | −0.0496 [−0.0515, −0.0478] | +0.0160 [+0.0153, +0.0167] | −0.0082 [−0.0087, −0.0077] |
+| 0.3 | −0.0020 [−0.0042, +0.0000] | +0.0467 [+0.0453, +0.0482] | −0.0119 [−0.0124, −0.0115] | +0.0177 [+0.0168, +0.0186] | −0.0033 [−0.0035, −0.0031] |
+| 1.0 | −0.0016 [−0.0029, −0.0003] | +0.0386 [+0.0372, +0.0400] | −0.0047 [−0.0049, −0.0045] | +0.0120 [+0.0113, +0.0128] | −0.0011 [−0.0012, −0.0010] |
+| 3.0 | −0.0006 [−0.0015, +0.0003] | +0.0235 [+0.0225, +0.0246] | −0.0014 [−0.0014, −0.0013] | +0.0063 [+0.0059, +0.0068] | −0.0003 [−0.0003, −0.0002] |
+
+τ=0.1 was fixed before any results. In low-cohesion groups it reduced the member gap about as much as τ=0.3 (and the most of any τ in high-cohesion groups), but mainly by lowering best-served members: its worst-member gain was the smallest of the four values tested. τ=0.3 gave the largest worst-member gain in low-cohesion groups. A possible cause, not verified, is that weights overcorrect as the worst-off member changes between dinners. Because the gap metric rewards leveling down, we treat worst-member predicted satisfaction as the primary fairness metric.
+
+### Pre-registered for test
+
+Pre-registered 2026-10-17, before any test-split evaluation: fairness_repeated with τ=0.3 yields a higher worst-member predicted percentile than least_misery in low-cohesion groups, at a smaller group-score cost. τ=0.1 remains the original pre-registered default and will be reported regardless of outcome.
+
+### Validation configurations tried
+
+Every group-evaluation configuration run on val, with how it can be verified. All used `ContentBasedCentered` with the chunked embeddings and rank-percentile normalization; no group evaluation has been run on test.
+
+1. Groups v1 (`groups.py` as in commit "Add synthetic dinner groups": no prior-history filter at construction, cap 3,000 groups, no per-user cap), `--sample 500`, strategies random / popularity / average / least_misery / fairness. Verified: `data/processed/group_eval_val_sample500.csv` (119 surviving groups).
+2. Groups v1, full val, same five strategies. Not verifiable: its output file was overwritten by later runs.
+3. Groups v2 (≥ 3 prior likes required at construction, cap 12,000, no per-user cap), full val, same five strategies, group-level (non-cluster) bootstrap. Not verifiable: this `groups.py` version was never committed and its outputs were overwritten.
+4. Groups v3 (current: v2 plus at most 10 groups per user), full val, same five strategies, cluster bootstrap. Not verifiable from `data/processed/` (overwritten by run 5); run 5 reproduced its five strategies' top-10 lists exactly when the aggregation interface changed.
+5. Groups v3, full val, the five strategies plus fairness_repeated with τ=0.1. Verified: `data/processed/group_eval_val.csv` and `group_eval_val_lists.parquet` (the tables above).
+6. Groups v3, τ sensitivity: fairness_repeated with τ ∈ {0.1, 0.3, 1.0, 3.0}. Verified: `data/processed/group_eval_val_tau_sensitivity.csv`. The same run also evaluated τ=1e6 as a sanity check against average (code path in `src/group_eval.py`; not in the CSV).
+
+The `--normalization raw` and `zscore` options exist in `src/group_eval.py`, but no val output for them exists and they have not been run. Individual-user (non-group) val runs are logged separately in `results.md` (random, popularity, content_chunked, content_blob).
+
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.
+- `is_open` isn't used: 1,449 of the 3,902 restaurants are marked closed in the dataset snapshot and remain in the catalog and in every candidate set.
+- Groups are co-rating groups: strangers who liked the same place within 30 days, not real dining parties. Targets skew toward popular restaurants, and the same targets appear in both val and test groups.
+- Possible small target-embedding leak: in 1,672 of the 7,008 val groups, a member's own review of the target is among the reviews encoded into the target's embedding. Within the low and mid target-popularity terciles, flagged and unflagged groups showed no significant hit@10 difference for any content strategy, but an effect of about 0.005 is not ruled out.
+- Groups share targets (handled by the cluster bootstrap) and members (up to 10 groups per user, not clustered), so the CIs are slightly optimistic.
