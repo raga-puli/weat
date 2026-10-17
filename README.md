@@ -41,7 +41,7 @@ groups.parquet (src/groups.py, built from train_reviews only)
 
 ## Group evaluation
 
-Setup: synthetic co-rating groups of 3–4 users who each liked (≥ 4 stars) the same target restaurant within 30 days of each other (`src/groups.py`). Each member's profile is built only from their 4+ star train reviews dated strictly before the group's window start, with the target excluded; every member has at least 3 such prior likes, and no user is in more than 10 groups. Candidates are all restaurants minus anything a member reviewed before the window, and the target is always a candidate. The model is `ContentBasedCentered`; each member's scores are converted to rank percentiles over the candidate set before aggregation, so all metrics below are in terms of predicted satisfaction. Results are on the val group split only (n = 7,008 groups over 1,310 target restaurants, k = 10); 95% CIs are cluster bootstraps over targets (1,000 resamples; all groups for a sampled target are kept together). Source: `python -m src.group_eval` (`data/processed/group_eval_val.csv`).
+Setup: synthetic co-rating groups of 3–4 users who each liked (≥ 4 stars) the same target restaurant within 30 days of each other (`src/groups.py`). Each member's profile is built only from their 4+ star train reviews dated strictly before the group's window start, with the target excluded; every member has at least 3 such prior likes, and no user is in more than 10 groups. Candidates are all restaurants minus anything a member reviewed before the window, and the target is always a candidate. The model is `ContentBasedCentered`; each member's scores are converted to rank percentiles over the candidate set before aggregation, so all metrics below are in terms of predicted satisfaction. Results are on the val group split only (n = 7,008 groups over 1,310 target restaurants, k = 10); 95% CIs are cluster bootstraps over targets (1,000 resamples; all groups for a sampled target are kept together). Source: `python -m src.group_eval` (`data/processed/group_eval_val.csv`). fairness_repeated's top-10 is a sequence of 10 dinners, so its hit@10 means "the target came up within 10 dinners."
 
 | strategy | hits | hit@10 [95% CI] | NDCG@10 [95% CI] | group score | worst member | fairness gap |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -85,6 +85,21 @@ fairness_repeated with each τ tested; differences vs. average with cluster-boot
 | 3.0 | −0.0006 [−0.0015, +0.0003] | +0.0235 [+0.0225, +0.0246] | −0.0014 [−0.0014, −0.0013] | +0.0063 [+0.0059, +0.0068] | −0.0003 [−0.0003, −0.0002] |
 
 τ=0.1 was fixed before any results. In low-cohesion groups it reduced the member gap about as much as τ=0.3 (and the most of any τ in high-cohesion groups), but mainly by lowering best-served members: its worst-member gain was the smallest of the four values tested. τ=0.3 gave the largest worst-member gain in low-cohesion groups. A possible cause, not verified, is that weights overcorrect as the worst-off member changes between dinners. Because the gap metric rewards leveling down, we treat worst-member predicted satisfaction as the primary fairness metric.
+
+### Per-dinner vs. cumulative fairness
+
+Worst member and fairness gap under both definitions (val, n = 7,008; predicted percentiles). Primary: each member's mean across the top-10 list, then the minimum / max − min over members. Secondary: the minimum / max − min over members for each restaurant, averaged over the list.
+
+| strategy | worst member (primary, member mean) | worst member (secondary, per restaurant) | fairness gap (primary, member mean) | fairness gap (secondary, per restaurant) |
+| --- | --- | --- | --- | --- |
+| average | 0.860 | 0.834 | 0.096 | 0.140 |
+| least_misery | 0.879 | 0.860 | 0.047 | 0.086 |
+| fairness | 0.879 | 0.858 | 0.049 | 0.087 |
+| fairness_repeated (τ=0.1) | 0.872 | 0.764 | 0.028 | 0.217 |
+
+fairness_repeated's per-restaurant fairness gap by cohesion tercile (2,336 groups each): 0.387 in the bottom (least cohesive) tercile vs. 0.078 in the top tercile; its member-mean gap is 0.039 and 0.017 respectively.
+
+The two definitions measure different things. Per-restaurant metrics ask whether each dinner works for everyone; member-mean metrics ask whether everyone is served equally across a sequence of dinners. fairness_repeated is designed for the second: it takes turns, so each restaurant tends to suit one member and the totals even out. It has the smallest cumulative gap and the largest per-dinner gap of the content strategies, and the difference grows as groups diverge. For a one-off dinner, least_misery is the better fit; for a group that eats together repeatedly, turn-taking is. Part of τ=0.1's apparent cost in the sensitivity analysis reflects this turn-taking rather than uniformly worse service.
 
 ### Pre-registered for test
 
