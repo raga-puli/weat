@@ -1,0 +1,23 @@
+# Postgres 16 + pgvector. Credentials come from .env (POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT);
+# the defaults below match DATABASE_URL in .env.example.
+# db/schema.sql only runs when the volume is first created; to re-run it: docker compose down -v
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rec}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rec}
+      POSTGRES_DB: ${POSTGRES_DB:-rec}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"  # set POSTGRES_PORT in .env if 5432 is taken locally
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
