@@ -4,17 +4,26 @@ import pytest
 
 import src.recommend as recommend
 from src.group_eval import (
+    ALL_STRATEGIES,
+    GROUPS_RESULTS,
     PreWindowPopularity,
+    _list_metrics,
     add_buckets,
     bootstrap_vs,
+    build_parser,
     cluster_bootstrap_ci,
     evaluate_groups,
     leak_by_popularity,
-    modeled_diffs_by_cohesion,
+    lift_cost_table,
     list_overlap,
+    log_results,
+    modeled_diffs_by_cohesion,
     paired_tests,
+    selected_strategies,
+    strategy_config,
     summarize,
     target_leak_flags,
+    tercile_table,
 )
 from src.recommend import ContentBased, ContentBasedCentered
 
@@ -466,3 +475,183 @@ def test_repeated_diagnostics():
     untied = [x for x in d["fr_top_is_lowest"][1:] if x is not None]
     assert untied and all(untied)  # softmax(-cum/tau): true by construction
     assert d["fr_max_weight"][1] > 0.9 and d["fr_dictator"][1]
+
+
+# --- CLI: strategy selection, --log, secondary metrics, regression ----------
+RICH_T0 = pd.Timestamp("2020-01-01")
+RICH_WINDOW = RICH_T0 + pd.Timedelta(days=100)
+RICH_IDS = ["t"] + [f"r{i:02d}" for i in range(39)]
+
+
+class RichModel(ContentBased):
+    def __init__(self):
+        m = np.random.default_rng(7).normal(size=(len(RICH_IDS), 8))
+        self.matrix = m / np.linalg.norm(m, axis=1, keepdims=True)
+        self.business_ids = list(RICH_IDS)
+        self.index = {b: i for i, b in enumerate(self.business_ids)}
+        self.name = "rich"
+
+
+def _rich_review(user, business, day, stars=5):
+    return {"user_id": user, "business_id": business, "stars": stars,
+            "date": RICH_T0 + pd.Timedelta(days=day)}
+
+
+def rich_train():
+    likes = {
+        "u1": ["r00", "r01", "r02", "r03"],
+        "u2": ["r04", "r05", "r06", "r07"],
+        "u3": ["r00", "r08", "r09", "r10"],
+        "u4": ["r11", "r12", "r13", "r14"],
+    }
+    rows = []
+    for user, businesses in likes.items():
+        rows += [_rich_review(user, b, 10 + 7 * j) for j, b in enumerate(businesses)]
+        rows.append(_rich_review(user, "t", 105))  # in-window like of the target
+        rows.append(_rich_review(user, "r30", 150))  # post-window: never used
+    rows.append(_rich_review("u2", "r15", 50, stars=2))  # pre-window dislike: excluded only
+    # non-members, for popularity: r20 popular before the window, r21 only after
+    rows += [_rich_review(f"x{i}", "r20", 60 + i) for i in range(3)]
+    rows += [_rich_review(f"y{i}", "r21", 120 + i) for i in range(6)]
+    return pd.DataFrame(rows)
+
+
+def rich_groups():
+    return pd.DataFrame(
+        [
+            {"group_id": "gA", "members": ["u1", "u2", "u3"], "target_business_id": "t",
+             "window_start": RICH_WINDOW, "size": 3, "split": "val"},
+            {"group_id": "gB", "members": ["u2", "u3", "u4"], "target_business_id": "t",
+             "window_start": RICH_WINDOW, "size": 3, "split": "val"},
+        ]
+    )
+
+
+# Primary metrics produced by evaluate_groups BEFORE the CLI/secondary-metric
+# changes, on the fixture above: (hit, ndcg, group_score, worst_member, fairness_gap).
+PRIMARY_SNAPSHOT = {
+    ("gA", "random"): (1.0, 0.38685280723454163, 0.4975308641975309, 0.46296296296296297, 0.06296296296296294),
+    ("gA", "popularity"): (1.0, 0.3562071871080222, 0.6, 0.5555555555555556, 0.12962962962962965),
+    ("gA", "average"): (1.0, 0.43067655807339306, 0.6617283950617283, 0.5814814814814815, 0.2148148148148148),
+    ("gA", "least_misery"): (1.0, 0.43067655807339306, 0.6333333333333333, 0.5703703703703704, 0.12962962962962954),
+    ("gA", "fairness"): (1.0, 0.5, 0.6481481481481481, 0.5592592592592591, 0.1888888888888891),
+    ("gA", "fairness_repeated"): (1.0, 0.3333333333333333, 0.617283950617284, 0.5925925925925926, 0.04444444444444451),
+    ("gB", "random"): (1.0, 0.5, 0.532051282051282, 0.523076923076923, 0.023076923076923217),
+    ("gB", "popularity"): (1.0, 0.38685280723454163, 0.5487179487179488, 0.49230769230769234, 0.12692307692307692),
+    ("gB", "average"): (1.0, 0.6309297535714575, 0.6884615384615383, 0.5884615384615384, 0.20000000000000018),
+    ("gB", "least_misery"): (1.0, 0.5, 0.6692307692307692, 0.5923076923076922, 0.14230769230769236),
+    ("gB", "fairness"): (1.0, 0.5, 0.6679487179487179, 0.6384615384615385, 0.04615384615384599),
+    ("gB", "fairness_repeated"): (1.0, 0.6309297535714575, 0.6679487179487179, 0.6615384615384615, 0.015384615384615441),
+}
+
+
+def _rich_run(**kwargs):
+    results, drops = evaluate_groups(rich_groups(), rich_train(), RichModel(), **kwargs)
+    return results
+
+
+def test_primary_metrics_unchanged_vs_previous_output():
+    results = _rich_run()
+    assert len(results) == len(PRIMARY_SNAPSHOT)
+    for r in results.itertuples():
+        expected = PRIMARY_SNAPSHOT[(r.group_id, r.strategy)]
+        got = (r.hit, r.ndcg, r.group_score, r.worst_member, r.fairness_gap)
+        assert got == pytest.approx(expected, rel=0, abs=1e-12), (r.group_id, r.strategy)
+
+
+@pytest.mark.parametrize("strategy", ALL_STRATEGIES)
+def test_strategy_runs_only_that_strategy(strategy):
+    one = _rich_run(strategies=(strategy,))
+    assert set(one["strategy"]) == {strategy}
+    assert len(one) == 2  # both groups
+    # identical to that strategy's rows from a full run
+    full = _rich_run()
+    cols = ["group_id", "hit", "ndcg", "group_score", "worst_member", "fairness_gap", "top_k"]
+    pd.testing.assert_frame_equal(
+        one[cols].reset_index(drop=True),
+        full[full["strategy"] == strategy][cols].reset_index(drop=True),
+    )
+
+
+def test_cli_strategy_selection():
+    parser = build_parser()
+    assert selected_strategies(parser.parse_args([])) == ALL_STRATEGIES
+    assert selected_strategies(parser.parse_args(["--all"])) == ALL_STRATEGIES
+    assert selected_strategies(parser.parse_args(["--strategy", "least_misery"])) == ("least_misery",)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--all", "--strategy", "average"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--strategy", "borda"])
+    args = parser.parse_args(["--strategy", "fairness", "--lam", "0.25", "--norm", "zscore"])
+    assert (args.lam, args.normalization) == (0.25, "zscore")
+
+
+def test_lam_reaches_fairness():
+    lam0 = _rich_run(strategies=("fairness", "average"), lam=0.0)
+    lists = lam0.pivot(index="group_id", columns="strategy", values="top_k")
+    assert all(list(a) == list(b) for a, b in zip(lists["fairness"], lists["average"]))
+
+
+def test_log_appends_one_row_per_strategy_and_never_touches_results_md(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "results.md").write_text("B's file\n")
+    results = _rich_run()
+    configs = {s: strategy_config(s, "rank", 0.5, None) for s in ALL_STRATEGIES}
+
+    def rows():
+        lines = GROUPS_RESULTS.read_text(encoding="utf-8").splitlines()
+        return [l for l in lines if l.startswith("| 20")]  # data rows start with the date
+
+    assert log_results(results, "val", "first", configs) == len(ALL_STRATEGIES)
+    first = rows()
+    assert len(first) == len(ALL_STRATEGIES)
+    assert [r.split(" | ")[2] for r in first] == list(ALL_STRATEGIES)
+    assert all(r.rstrip().endswith("| first |") for r in first)
+
+    one = results[results["strategy"] == "least_misery"]
+    assert log_results(one, "val", "second", {"least_misery": configs["least_misery"]}) == 1
+    second = rows()
+    assert second[: len(first)] == first
+    assert len(second) == len(first) + 1 and "| least_misery |" in second[-1]
+
+    text = GROUPS_RESULTS.read_text(encoding="utf-8")
+    assert text.count("| date | split | strategy |") == 1  # header written once
+    assert "PREDICTED" in text
+    assert (tmp_path / "results.md").read_text() == "B's file\n"
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()) == [
+        "results.md",
+        "results/groups.md",
+    ]
+
+
+def test_secondary_metrics_hand_computed():
+    # 2 members x 4 candidates (rank percentiles); the list is items 0, 1, 2.
+    pct = np.array(
+        [
+            [0.0, 0.5, 1.0, 0.25],
+            [1.0, 0.5, 0.0, 0.75],
+        ]
+    )
+    m = _list_metrics(np.array([0, 1, 2]), target_idx=1, pct=pct)
+    # primary (member means over the list): both members average 0.5
+    assert m["group_score"] == pytest.approx(0.5)
+    assert m["worst_member"] == pytest.approx(0.5)
+    assert m["fairness_gap"] == pytest.approx(0.0)
+    # secondary (per restaurant): mins [0, .5, 0] -> 1/6; spreads [1, 0, 1] -> 2/3
+    assert m["worst_member_per_item"] == pytest.approx(1 / 6)
+    assert m["fairness_gap_per_item"] == pytest.approx(2 / 3)
+    assert m["hit"] == 1.0 and m["ndcg"] == pytest.approx(1 / np.log2(3))
+
+
+def test_lift_cost_and_tercile_tables():
+    results = add_buckets(_rich_run())
+    lift = lift_cost_table(results)
+    assert "average" not in lift.index and set(lift.index) == set(ALL_STRATEGIES) - {"average"}
+    per_group = results.pivot(index="group_id", columns="strategy", values="worst_member")
+    assert lift.loc["least_misery", "worst_member diff (PREDICTED)"] == pytest.approx(
+        (per_group["least_misery"] - per_group["average"]).mean()
+    )
+    terciles = tercile_table(results)
+    assert set(terciles.index.get_level_values("cohesion_tercile")) <= {"bottom", "top", "all"}
+    assert (terciles.loc["all", "n"] == 2).all()
+    assert {"worst_member_per_item", "fairness_gap_per_item"} <= set(terciles.columns)
