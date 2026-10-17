@@ -29,6 +29,15 @@ reviews.parquet
 embeddings.npy    -> (n_restaurants, 384) float32
 business_ids.txt  -> one business_id per line, same order as embeddings
 
+groups.parquet (src/groups.py, built from train_reviews only)
+  group_id (str): 12-char content hash of members + target
+  members (list[str]): 3-4 distinct user_ids, all from the val split, sorted
+  target_business_id (str): held-out restaurant every member rated >= 4 stars within the window
+  window_start (timestamp): earliest member's review of the target; all members' reviews fall within 30 days of it
+  size (int): number of members (3 or 4)
+  split (str): "val" or "test", 70/30, deterministic from SEED + group_id
+
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.
+- Groups are co-rating groups: strangers who liked the same place within 30 days, not real dining parties. Targets skew toward popular restaurants, and the same targets appear in both val and test groups.
