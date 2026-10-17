@@ -2,8 +2,8 @@
 .venv
 
 # data
-data/raw/
-data/processed/
+data/*
+!data/.gitkeep
 *.npy
 *.parquet
 
