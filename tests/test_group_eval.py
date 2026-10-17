@@ -655,3 +655,23 @@ def test_lift_cost_and_tercile_tables():
     assert set(terciles.index.get_level_values("cohesion_tercile")) <= {"bottom", "top", "all"}
     assert (terciles.loc["all", "n"] == 2).all()
     assert {"worst_member_per_item", "fairness_gap_per_item"} <= set(terciles.columns)
+
+
+def test_tau_sensitivity_includes_secondary_metrics():
+    from src.group_eval import tau_sensitivity
+
+    results = add_buckets(_rich_run(extra_taus=(0.3,)))
+    # the fixture has two groups -> one per median-split bucket
+    table = tau_sensitivity(results, taus=(0.1, 0.3), n_boot=50)
+    metrics = set(table["metric"])
+    for metric in ("worst_member_per_item", "fairness_gap_per_item"):
+        assert f"{metric} (SECONDARY)" in metrics
+        assert f"{metric} - average (SECONDARY)" in metrics
+        assert f"{metric} - (tau=0.3) (SECONDARY)" in metrics
+    level = table[(table["metric"] == "fairness_gap_per_item (SECONDARY)") & (table["tau"] == 0.1)]
+    expected = results[results["strategy"] == "fairness_repeated"].set_index("group_id")
+    for row in level.itertuples():
+        gids = results[results["cohesion_bucket"] == row.cohesion_bucket]["group_id"].unique()
+        assert row.value == pytest.approx(expected.loc[gids, "fairness_gap_per_item"].mean())
+    # primary rows still come first and keep their metric labels
+    assert list(table["metric"].iloc[:4]) == ["hit@10", "hit@10 - average", "hit@10", "hit@10 - average"]

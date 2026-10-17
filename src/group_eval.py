@@ -616,6 +616,30 @@ def tau_sensitivity(results: pd.DataFrame, taus=SENSITIVITY_TAUS,
                 rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} - average",
                              "value": d[f"{metric}_diff_vs_average"], "ci_lo": d["ci_lo"],
                              "ci_hi": d["ci_hi"], "n": n})
+    # SECONDARY per-restaurant metrics: level and difference vs average per
+    # tau, plus a paired default-tau vs tau=0.3 comparison.
+    for bucket in ("low", "high"):
+        part = results[results["cohesion_bucket"] == bucket]
+        n = part["group_id"].nunique()
+        for metric in SECONDARY_METRICS:
+            table = _per_group(part, metric)
+            clusters = _targets(part, table.index)
+            mdiffs = bootstrap_vs(part, "average", metric, n_boot, seed)
+            for tau in taus:
+                name = _repeated_name(tau)
+                lo, hi = cluster_bootstrap_ci(table[name].to_numpy(), clusters, n_boot, seed)
+                rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} (SECONDARY)",
+                             "value": table[name].mean(), "ci_lo": lo, "ci_hi": hi, "n": n})
+                d = mdiffs.loc[name]
+                rows.append({"tau": tau, "cohesion_bucket": bucket, "metric": f"{metric} - average (SECONDARY)",
+                             "value": d[f"{metric}_diff_vs_average"], "ci_lo": d["ci_lo"],
+                             "ci_hi": d["ci_hi"], "n": n})
+            if TAU in taus and 0.3 in taus and TAU != 0.3:
+                d = bootstrap_vs(part, _repeated_name(0.3), metric, n_boot, seed).loc[_repeated_name(TAU)]
+                rows.append({"tau": TAU, "cohesion_bucket": bucket,
+                             "metric": f"{metric} - (tau=0.3) (SECONDARY)",
+                             "value": d[f"{metric}_diff_vs_{_repeated_name(0.3)}"], "ci_lo": d["ci_lo"],
+                             "ci_hi": d["ci_hi"], "n": n})
     table = pd.DataFrame(rows)
     table.insert(0, "analysis", "tau_sensitivity (not the headline; default tau=%g)" % TAU)
     return table
