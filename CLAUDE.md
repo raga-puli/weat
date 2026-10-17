@@ -22,8 +22,9 @@ A group restaurant recommender built from the Yelp Academic Dataset, scoped to P
 - Never evaluate on the test split unless the user explicitly says so.
 - Never commit anything under `data/`.
 - Group evaluation uses the val group split unless the user explicitly says test.
-- Never put API keys or passwords in committed files; read them from .env.
+- Never commit secrets; read config from .env.
 - Only write results files through their owning script's --log flag.
+- LLM calls go through Ollama (OLLAMA_HOST, LLM_MODEL from .env). Parser calls use temperature 0 and a JSON-schema `format`. Pin the exact model tag in every results/parser.md row.
 
 ## Environment
 
