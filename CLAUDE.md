@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A group restaurant recommender built from the Yelp Academic Dataset, scoped to Philadelphia restaurants (see README.md). The pipeline: raw Yelp JSON -> filtered/joined Parquet tables (DuckDB) -> sentence embeddings per restaurant (SentenceTransformers) -> recommendation models -> offline evaluation against a held-out split.
 
-## File ownership (week 1)
+## File ownership (WEEK 2)
 
 | Person | Owns |
 | --- | --- |
-| A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `tests/test_split.py`, `tests/test_recommend.py`, `README.md` |
-| B | `src/eval.py`, `src/baselines.py`, `results.md`, `tests/test_eval.py`, `tests/test_baselines.py` |
-| Shared, FROZEN after this commit | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore` |
+| A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `src/groups.py`, `src/aggregate.py`, `src/group_eval.py`, `src/db_groups.py`, `db/groups.sql`, `results/groups.md`, `tests/test_groups.py`, `tests/test_aggregate.py`, `tests/test_group_eval.py`, `README.md` |
+| B | `src/eval.py`, `src/baselines.py`, `results.md`, `src/query_parser.py`, `src/search.py`, `src/db.py`, `src/bench.py`, `docker-compose.yml`, `eval/queries.jsonl`, `results/parser.md`, `results/latency.md`, `tests/test_query_parser.py`, `tests/test_search.py` |
+| Shared, FROZEN | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore`, `.env.example`, `db/schema.sql` |
 
 ### Rules
 
@@ -21,6 +21,9 @@ A group restaurant recommender built from the Yelp Academic Dataset, scoped to P
 - Never edit `results.md` except via `python -m src.eval --log`.
 - Never evaluate on the test split unless the user explicitly says so.
 - Never commit anything under `data/`.
+- Group evaluation uses the val group split unless the user explicitly says test.
+- Never put API keys or passwords in committed files; read them from .env.
+- Only write results files through their owning script's --log flag.
 
 ## Environment
 

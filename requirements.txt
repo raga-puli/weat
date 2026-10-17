@@ -1,4 +1,4 @@
-duckdb
+﻿duckdb
 pandas
 pyarrow
 sentence-transformers
@@ -6,3 +6,8 @@ numpy
 streamlit
 pytest
 scipy
+psycopg[binary]
+pgvector
+anthropic
+python-dotenv
+tqdm
