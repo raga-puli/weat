@@ -675,3 +675,203 @@ def test_tau_sensitivity_includes_secondary_metrics():
         assert row.value == pytest.approx(expected.loc[gids, "fairness_gap_per_item"].mean())
     # primary rows still come first and keep their metric labels
     assert list(table["metric"].iloc[:4]) == ["hit@10", "hit@10 - average", "hit@10", "hit@10 - average"]
+
+
+# --- db_groups: SQL group scoring (centered embeddings + percent_rank) -------
+
+from src.db_groups import (  # noqa: E402
+    build_group_query,
+    group_candidates,
+    lists_match,
+    percent_rank,
+    reference_candidates,
+)
+
+
+class _FakeConn:
+    """Minimal stand-in for a psycopg connection: each fetch pops the next
+    canned result; executed SQL is recorded."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.executed = []
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+
+class _FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.executed.append((sql, params))
+
+    def fetchall(self):
+        return self.conn.results.pop(0)
+
+    def fetchone(self):
+        rows = self.conn.results.pop(0)
+        return rows[0] if rows else None
+
+
+def test_build_group_query_validates_strategy():
+    with pytest.raises(ValueError, match="unknown strategy"):
+        build_group_query("fairness")
+    assert "AVG(pct)" in build_group_query("average")
+    assert "MIN(pct)" in build_group_query("least_misery")
+
+
+def test_build_group_query_structure():
+    sql = build_group_query("average")
+    assert "restaurant_centered" in sql and "restaurants r" not in sql
+    assert "percent_rank() OVER (PARTITION BY m.user_id ORDER BY 1 - (m.embedding <=> c.embedding))" in sql
+    assert 'ORDER BY score DESC, business_id COLLATE "C"' in sql
+    assert "user_reviewed" in sql  # exclude_reviewed defaults on
+    assert "user_reviewed" not in build_group_query("average", exclude_reviewed=False)
+    assert "is_open = 1" not in sql
+    assert "is_open = 1" in build_group_query("average", open_only=True)
+    # exclusions are applied in the candidates CTE, i.e. before percent_rank
+    assert sql.index("user_reviewed") < sql.index("percent_rank")
+
+
+def test_group_candidates_rejects_bad_strategy_before_querying():
+    conn = _FakeConn()
+    with pytest.raises(ValueError):
+        group_candidates(conn, ["u1"], strategy="borda")
+    assert conn.executed == []
+
+
+def test_group_candidates_names_members_without_taste_vectors():
+    # query returns rows aggregated over 2 of 3 members; lookup finds u1, u2
+    conn = _FakeConn([("b1", 0.9, 2), ("b2", 0.8, 2)], [("u1",), ("u2",)])
+    with pytest.raises(ValueError, match=r"\['u3'\]"):
+        group_candidates(conn, ["u1", "u2", "u3"], "average")
+
+
+def test_group_candidates_returns_rows_when_all_members_present():
+    conn = _FakeConn([("b1", 0.9, 2), ("b2", 0.8, 2)])
+    assert group_candidates(conn, ["u2", "u1", "u1"], "average", k=2) == [("b1", 0.9), ("b2", 0.8)]
+    sql, params = conn.executed[0]
+    assert params == {"members": ["u1", "u2"], "k": 2}
+
+
+def test_open_only_without_is_open_column_raises():
+    conn = _FakeConn([])  # information_schema lookup finds no is_open column
+    with pytest.raises(NotImplementedError, match="restaurants.is_open"):
+        group_candidates(conn, ["u1"], "average", open_only=True)
+
+
+def test_percent_rank_uses_lowest_rank_for_ties():
+    # Postgres percent_rank: tied values share the lowest rank
+    np.testing.assert_allclose(percent_rank(np.array([[0.2, 0.2, 0.9, 0.5]])), [[0, 0, 1, 2 / 3]])
+    # src.aggregate's "rank" norm gives ties the average rank instead
+    from src.aggregate import normalize
+
+    np.testing.assert_allclose(
+        normalize(np.array([[0.2, 0.2, 0.9, 0.5]]), np.zeros(4, dtype=bool), "rank"), [[1 / 6, 1 / 6, 1, 2 / 3]]
+    )
+    assert percent_rank(np.array([[0.4]])).tolist() == [[0.0]]
+
+
+def _db_fixture_data():
+    rng = np.random.default_rng(11)
+    ids = [f"b{i:02d}" for i in range(30)]
+    restaurants = rng.normal(size=(30, 384))
+    restaurants /= np.linalg.norm(restaurants, axis=1, keepdims=True)
+    taste = {u: v / np.linalg.norm(v) for u, v in zip(["u1", "u2", "u3"], rng.normal(size=(3, 384)))}
+    reviewed = [("u1", "b00"), ("u1", "b05"), ("u2", "b07"), ("u3", "b00")]
+    return ids, restaurants.astype(np.float32), taste, reviewed
+
+
+def test_reference_matches_src_aggregate_rank_without_ties():
+    from src.aggregate import STRATEGIES as AGGREGATORS
+
+    ids, matrix, taste, reviewed = _db_fixture_data()
+    index = {b: i for i, b in enumerate(ids)}
+    exclude = {b for _, b in reviewed}
+    for strategy in ("average", "least_misery"):
+        top, _ = reference_candidates(taste, matrix, index, ["u1", "u2", "u3"], strategy, 10, exclude)
+        scores = np.stack([matrix @ taste[u] for u in ["u1", "u2", "u3"]])
+        excluded = np.array([b in exclude for b in ids])
+        np.testing.assert_array_equal(top, AGGREGATORS[strategy](scores, excluded, 10, norm="rank"))
+        assert not any(ids[i] in exclude for i in top)
+
+
+@pytest.fixture(scope="module")
+def pg():
+    """A throwaway schema with synthetic data; skipped when DATABASE_URL is
+    unset or the database isn't reachable. Never touches the real tables."""
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    if not os.getenv("DATABASE_URL"):
+        pytest.skip("DATABASE_URL is not set")
+    try:
+        from src.db import get_conn
+
+        conn = get_conn()
+    except Exception:
+        pytest.skip("database not reachable")
+    from src.db_groups import apply_schema
+
+    conn.autocommit = True
+    schema = f"test_db_groups_{os.getpid()}"
+    ids, matrix, taste, reviewed = _db_fixture_data()
+    try:
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"SET search_path TO {schema}, public")
+        apply_schema(conn)
+        conn.execute("CREATE TABLE restaurants (business_id text PRIMARY KEY)")  # no is_open, like B's
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO restaurants VALUES (%s)", [(b,) for b in ids])
+            cur.executemany("INSERT INTO restaurant_centered VALUES (%s, %s)", list(zip(ids, matrix)))
+            cur.executemany("INSERT INTO user_taste VALUES (%s, %s)",
+                            [(u, v.astype(np.float32)) for u, v in taste.items()])
+            cur.executemany("INSERT INTO user_reviewed VALUES (%s, %s)", reviewed)
+        yield conn, (ids, matrix, taste, reviewed)
+    finally:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.close()
+
+
+@pytest.mark.parametrize("strategy", ["average", "least_misery"])
+def test_db_group_candidates_match_reference(pg, strategy):
+    conn, (ids, matrix, taste, reviewed) = pg
+    index = {b: i for i, b in enumerate(ids)}
+    members = ["u1", "u2", "u3"]
+    exclude = {b for u, b in reviewed if u in members}
+    sql = group_candidates(conn, members, strategy, k=10)
+    top, group_score = reference_candidates(taste, matrix, index, members, strategy, 10, exclude)
+    sql_ids = [b for b, _ in sql]
+    assert not exclude & set(sql_ids)
+    one_rank = 1 / (len(ids) - len(exclude) - 1)
+    assert lists_match(sql_ids, [ids[i] for i in top], group_score, index, tol=one_rank)[1]
+    for b, score in sql:
+        assert score == pytest.approx(group_score[index[b]], abs=one_rank)
+
+
+def test_db_exclude_reviewed_off_keeps_reviewed(pg):
+    conn, (ids, *_rest) = pg
+    sql = group_candidates(conn, ["u1"], "average", k=len(ids), exclude_reviewed=False)
+    assert {"b00", "b05"} <= {b for b, _ in sql}
+
+
+def test_db_open_only_raises_without_is_open(pg):
+    conn, _ = pg
+    with pytest.raises(NotImplementedError):
+        group_candidates(conn, ["u1"], "average", open_only=True)
+
+
+def test_db_missing_member_raises(pg):
+    conn, _ = pg
+    with pytest.raises(ValueError, match="nobody"):
+        group_candidates(conn, ["u1", "nobody"], "average")
