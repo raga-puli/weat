@@ -288,26 +288,38 @@ def sample_users(
         group_id = row["group_id"]
         users = sorted(rng.choice(list(row["members"]), size=n, replace=False).tolist())
 
-    out = []
-    for u in users:
-        reviews = user_reviews.get(u, pd.DataFrame(columns=["business_id", "stars"]))
-        top = reviews.sort_values(["stars", "business_id"], ascending=[False, True]).head(PROFILE_SIZE)
-        out.append(
-            {
-                "user_id": u,
-                "profile": [
-                    {"business_id": b,
-                     "name": restaurants["name"].get(b),
-                     "stars": float(s)}
-                    for b, s in zip(top["business_id"], top["stars"])
-                ],
-            }
-        )
-    response = {"cohesion_bucket": cohesion, "seed": seed, "users": out}
+    response = {"cohesion_bucket": cohesion, "seed": seed,
+                "users": [_profile(u, restaurants, user_reviews) for u in users]}
     if group_id is not None:
         response["group_id"] = group_id
         response["cohesion"] = _cohesion(np.stack([model.taste[u] for u in users]))
     return response
+
+
+def _profile(user_id: str, restaurants, user_reviews) -> dict:
+    """A user's PROFILE_SIZE highest-rated train restaurants (ties by business_id)."""
+    reviews = user_reviews.get(user_id, pd.DataFrame(columns=["business_id", "stars"]))
+    top = reviews.sort_values(["stars", "business_id"], ascending=[False, True]).head(PROFILE_SIZE)
+    return {
+        "user_id": user_id,
+        "profile": [
+            {"business_id": b, "name": restaurants["name"].get(b), "stars": float(s)}
+            for b, s in zip(top["business_id"], top["stars"])
+        ],
+    }
+
+
+@router.get("/users/profiles")
+def user_profiles(
+    user_ids: list[str] = Query(..., min_length=1, max_length=MAX_MEMBERS),
+    model=Depends(get_recommender),
+    restaurants=Depends(get_restaurants),
+    user_reviews=Depends(get_user_reviews),
+) -> dict:
+    """Profiles ("top-rated places") for typed-in user_ids; 422 naming any
+    unknown user or user without a taste profile."""
+    _profiles(model, list(user_ids))
+    return {"users": [_profile(u, restaurants, user_reviews) for u in user_ids]}
 
 
 @router.post("/recommend")
