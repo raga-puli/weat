@@ -2,9 +2,11 @@
 
 Scoring runs in numpy through src/aggregate.py (not the SQL path in
 src/db_groups.py), because only the numpy path supports per-member
-normalization. The model is ContentBasedCentered, the configuration the README's
-group evaluation reports. Taste vectors are each user's whole train history,
-for users with 5+ reviews (users.parquet); other user_ids get a 422.
+normalization. The model is ContentBasedDebiased: ContentBasedCentered (the
+README's headline configuration) plus the hubness correction described there.
+Taste vectors are each user's whole train history, for users with 5+ reviews
+(users.parquet); other user_ids get a 422. The hub vector is the mean over those
+served users, not over all train users as in src.eval / group_eval.
 
 Heavy resources come from lru_cache getters used as dependencies, so tests can
 override them and nothing loads at import time. Closed restaurants are excluded
@@ -23,7 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 from src import interfaces
 from src.aggregate import LAMBDA, STRATEGIES as AGGREGATORS, fairness_repeated, normalize
 from src.groups import GROUPS
-from src.recommend import ContentBasedCentered
+from src.recommend import ContentBasedCentered, ContentBasedDebiased
 
 router = APIRouter(prefix="/group", tags=["group"])
 
@@ -31,6 +33,9 @@ Strategy = Literal["average", "least_misery", "fairness", "fairness_repeated"]
 Norm = Literal["raw", "zscore", "rank"]
 PROFILE_SIZE = 5
 MIN_MEMBERS, MAX_MEMBERS = 2, 6
+# The served model. All scoring goes through model.scores_for (the per-user
+# score function), so switching to e.g. ContentBasedDebiased is this one line.
+RECOMMENDER = ContentBasedDebiased
 
 
 # --- dependencies --------------------------------------------------------------
@@ -48,7 +53,7 @@ def _serving_train() -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def get_recommender() -> ContentBasedCentered:
-    model = ContentBasedCentered()
+    model = RECOMMENDER()
     model.fit(_serving_train())
     return model
 
