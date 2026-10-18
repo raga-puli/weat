@@ -44,7 +44,7 @@ class ContentBased:
             return result
 
         taste_matrix = np.stack([self.taste[user_id] for user_id in known_users])
-        sims = taste_matrix @ self.matrix.T
+        sims = self._score_matrix(taste_matrix)
 
         for row, user_id in enumerate(known_users):
             row_sims = sims[row].copy()
@@ -88,9 +88,14 @@ class ContentBased:
         return vec / norm if norm > 0 else None
 
     def scores_for(self, taste: np.ndarray) -> np.ndarray:
-        """Cosine of `taste` against every restaurant, in business_ids.txt
-        order (rows of self.matrix are unit-norm)."""
+        """The per-user score of every restaurant, in business_ids.txt order:
+        here the cosine with `taste` (rows of self.matrix are unit-norm).
+        Subclasses that change scoring override this (and _score_matrix)."""
         return self.matrix @ taste
+
+    def _score_matrix(self, taste_matrix: np.ndarray) -> np.ndarray:
+        """scores_for for a batch of users: (n_users, n_restaurants)."""
+        return taste_matrix @ self.matrix.T
 
 
 class ContentBasedBlob(ContentBased):
@@ -113,6 +118,43 @@ class ContentBasedCentered(ContentBased):
         norms = np.linalg.norm(centered, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         self.matrix = centered / norms
+
+
+class ContentBasedDebiased(ContentBasedCentered):
+    """ContentBasedCentered with each restaurant's mean score subtracted.
+
+    After fit, hub[r] is the mean over all fitted users u of cos(u, r), and
+    every score is cos(u, r) - hub[r]. That is column-centering of the
+    user-by-restaurant score matrix: a hubness correction that stops
+    restaurants close to almost everyone's taste from topping every list.
+    It was fixed in advance and has no parameters. Because cosine is linear
+    in u, hub = matrix @ (mean taste vector), a single matrix-vector product.
+    Before fit, hub is zero and scores are plain cosines.
+    """
+
+    def __init__(self, embeddings_path=EMBEDDINGS, name="content_debiased"):
+        super().__init__(embeddings_path=embeddings_path, name=name)
+        self.hub = np.zeros(len(self.business_ids), dtype=self.matrix.dtype)
+
+    def fit(self, train: pd.DataFrame) -> None:
+        super().fit(train)
+        if self.taste:
+            mean_taste = np.stack(list(self.taste.values())).mean(axis=0)
+            self.hub = self.matrix @ mean_taste
+        else:
+            self.hub = np.zeros(len(self.business_ids), dtype=self.matrix.dtype)
+
+    def scores_for(self, taste: np.ndarray) -> np.ndarray:
+        return self.matrix @ taste - self.hub
+
+    def _score_matrix(self, taste_matrix: np.ndarray) -> np.ndarray:
+        return taste_matrix @ self.matrix.T - self.hub
+
+    def score(self, user_id, business_ids):
+        if user_id not in self.taste:
+            return [float("nan")] * len(business_ids)
+        scores = self.scores_for(self.taste[user_id])
+        return [float(scores[self.index[b]]) if b in self.index else float("nan") for b in business_ids]
 
 
 def hubness_diagnostics(recs, catalog_business_ids, seed=SEED, n_pairs=500):

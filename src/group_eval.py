@@ -25,7 +25,13 @@ from src.aggregate import LAMBDA, NORMS, TAU, fairness_repeated, normalize
 from src.aggregate import STRATEGIES as AGGREGATORS
 from src.groups import GROUPS, MIN_PRIOR_LIKES
 from src.interfaces import DATA, RELEVANT_MIN_STARS, SEED, TRAIN_REVIEWS
-from src.recommend import ContentBasedCentered
+from src.recommend import ContentBasedCentered, ContentBasedDebiased
+
+# --model choices. Member profiles always come from taste_vector_from (pre-window
+# likes); ContentBasedDebiased is additionally fit on all of TRAIN_REVIEWS for its
+# hub vector, a single global statistic (not per-group, not time-respecting).
+MODELS = {"ContentBasedCentered": ContentBasedCentered, "ContentBasedDebiased": ContentBasedDebiased}
+DEFAULT_MODEL = "ContentBasedCentered"
 
 K = 10
 N_BOOTSTRAP = 1000
@@ -502,8 +508,11 @@ def tercile_table(results: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(tables).reorder_levels(["cohesion_tercile", "strategy"])
 
 
-def strategy_config(strategy: str, normalization: str, lam: float, sample: int | None) -> str:
+def strategy_config(strategy: str, normalization: str, lam: float, sample: int | None,
+                    model: str = DEFAULT_MODEL) -> str:
     parts = [f"norm={normalization}", f"k={K}", "groups: >=3 prior likes, <=10/user"]
+    if model != DEFAULT_MODEL:
+        parts.insert(0, f"model={model}")
     if strategy == "fairness":
         parts.append(f"lam={lam:g}")
     if strategy == "fairness_repeated":
@@ -547,6 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lam", type=float, default=LAMBDA, help="fairness lambda")
     parser.add_argument("--log", metavar="NOTE", default=None,
                         help=f"append one row per strategy to {GROUPS_RESULTS}")
+    parser.add_argument("--model", choices=sorted(MODELS), default=DEFAULT_MODEL,
+                        help="recommender class (default ContentBasedCentered)")
     parser.add_argument("--tau-sensitivity", action="store_true",
                         help="sensitivity analysis of fairness_repeated's tau (separate CSV)")
     return parser
@@ -662,7 +673,10 @@ if __name__ == "__main__":
     train = pd.read_parquet(
         TRAIN_REVIEWS, columns=["review_id", "user_id", "business_id", "stars", "date"]
     )
-    model = ContentBasedCentered()
+    model = MODELS[args.model]()
+    if isinstance(model, ContentBasedDebiased):
+        model.fit(train[["user_id", "business_id", "stars"]])  # hub vector only; see MODELS note
+    model_suffix = "" if args.model == DEFAULT_MODEL else f"_{model.name}"
 
     extra_taus = (*[t for t in SENSITIVITY_TAUS if t != TAU], 1e6) if args.tau_sensitivity else ()
     results, drops = evaluate_groups(groups, train, model, normalization=args.normalization,
@@ -697,7 +711,7 @@ if __name__ == "__main__":
         table = tau_sensitivity(results)
         print(f"\n== tau sensitivity (cluster bootstrap by target, {N_BOOTSTRAP} resamples) ==")
         print(table.drop(columns="analysis").round(4).to_string(index=False))
-        out = DATA / f"group_eval_{args.split}_tau_sensitivity.csv"
+        out = DATA / f"group_eval_{args.split}{model_suffix}_tau_sensitivity.csv"
         table.to_csv(out, index=False)
         print(f"\nwrote {out}")
         raise SystemExit(0)
@@ -713,7 +727,8 @@ if __name__ == "__main__":
     boot = f"cluster bootstrap over {n_targets} targets, {N_BOOTSTRAP} resamples"
     compare = len(strategies) > 1 and "average" in strategies
     pd.set_option("display.width", 220)
-    print(f"\n== {args.split}, normalization={args.normalization}, lam={args.lam:g}, k={K} ({boot}) ==")
+    print(f"\n== {args.split}, model={model.name}, normalization={args.normalization}, "
+          f"lam={args.lam:g}, k={K} ({boot}) ==")
     print(main_table_with_ci(results).round(4).to_string())
     print(summarize(results, ["strategy"]).round(4).to_string())
     if compare:
@@ -751,7 +766,8 @@ if __name__ == "__main__":
           f"(cluster bootstrap by target within cell, {N_BOOTSTRAP} resamples) ==")
     print(leak_by_popularity(results).round(4).to_string())
 
-    suffix = "" if args.normalization == "rank" else f"_{args.normalization}"
+    suffix = model_suffix
+    suffix += "" if args.normalization == "rank" else f"_{args.normalization}"
     suffix += f"_lam{args.lam:g}" if args.lam != LAMBDA else ""
     suffix += f"_{args.strategy}" if args.strategy else ""
     suffix += f"_sample{args.sample}" if args.sample is not None else ""
@@ -762,6 +778,6 @@ if __name__ == "__main__":
     print(f"\nwrote {out}\nwrote {lists_out}")
 
     if args.log is not None:
-        configs = {s: strategy_config(s, args.normalization, args.lam, args.sample) for s in strategies}
+        configs = {s: strategy_config(s, args.normalization, args.lam, args.sample, args.model) for s in strategies}
         n = log_results(results, args.split, args.log, configs)
         print(f"logged {n} rows to {GROUPS_RESULTS}")

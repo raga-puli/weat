@@ -165,3 +165,85 @@ class TestHubnessDiagnostics:
         recs = {"u1": ["a"], "u2": ["b"], "u3": ["c"]}
         result = hubness_diagnostics(recs, ["a", "b", "c"], seed=1, n_pairs=50)
         assert result["mean_top10_overlap"] == pytest.approx(0.0)
+
+
+# --- ContentBasedDebiased: column-centered (hub-corrected) scores ------------------
+
+import src.recommend as recommend_module  # noqa: E402
+from src.recommend import ContentBasedDebiased  # noqa: E402
+
+
+def _debiased_with(monkeypatch, matrix, ids):
+    monkeypatch.setattr(recommend_module, "load_embeddings", lambda path: (matrix.astype(np.float32), list(ids)))
+    return ContentBasedDebiased(), ContentBasedCentered()
+
+
+def _likes(pairs):
+    return pd.DataFrame([{"user_id": u, "business_id": b, "stars": 5} for u, b in pairs])
+
+
+def _hub_world():
+    """4 users who each like their own item (e0..e3 directions); a "hub"
+    restaurant along e0+e1+e2+e3 is moderately close to all of them; each user
+    also has a near-own candidate."""
+    rng = np.random.default_rng(3)
+    eye = np.eye(8)
+    rows, ids = [], []
+    for i in range(4):
+        rows.append(eye[i]); ids.append(f"own{i}")                                  # liked
+        rows.append(eye[i] + 0.8 * eye[4 + i] + 0.05 * rng.normal(size=8)); ids.append(f"near{i}")
+        rows.append(0.3 * eye[i] + eye[4 + (i + 1) % 4]); ids.append(f"far{i}")
+    rows.append(eye[:4].sum(axis=0) + 0.1 * eye[4:].sum(axis=0)); ids.append("hub")
+    m = np.array(rows)
+    return m / np.linalg.norm(m, axis=1, keepdims=True), ids
+
+
+def test_debiased_hub_uses_only_fitted_users(monkeypatch):
+    matrix, ids = _hub_world()
+    debiased, _ = _debiased_with(monkeypatch, matrix, ids)
+    np.testing.assert_array_equal(debiased.hub, 0)  # before fit: plain cosine
+
+    debiased.fit(_likes([("u0", "own0"), ("u1", "own1")]))
+    assert set(debiased.taste) == {"u0", "u1"}
+    expected = np.mean([debiased.matrix @ debiased.taste[u] for u in ("u0", "u1")], axis=0)
+    np.testing.assert_allclose(debiased.hub, expected, atol=1e-6)
+
+    # refitting on different users recomputes hub from those users only
+    debiased.fit(_likes([("u2", "own2")]))
+    np.testing.assert_allclose(debiased.hub, debiased.matrix @ debiased.taste["u2"], atol=1e-6)
+
+
+def test_debiased_scores_are_cosine_minus_hub(monkeypatch):
+    matrix, ids = _hub_world()
+    debiased, centered = _debiased_with(monkeypatch, matrix, ids)
+    train = _likes([(f"u{i}", f"own{i}") for i in range(4)])
+    debiased.fit(train)
+    centered.fit(train)
+    for u in debiased.taste:
+        cosine = centered.scores_for(centered.taste[u])
+        np.testing.assert_allclose(debiased.scores_for(debiased.taste[u]), cosine - debiased.hub, atol=1e-6)
+        np.testing.assert_allclose(debiased.score(u, ids), cosine - debiased.hub, atol=1e-6)
+    np.testing.assert_allclose(
+        debiased._score_matrix(np.stack([debiased.taste[u] for u in ("u0", "u1")])),
+        np.stack([debiased.scores_for(debiased.taste[u]) for u in ("u0", "u1")]),
+        atol=1e-6,
+    )
+    assert debiased.name == "content_debiased"
+
+
+def test_debiased_hub_restaurant_drops_in_rank(monkeypatch):
+    matrix, ids = _hub_world()
+    debiased, centered = _debiased_with(monkeypatch, matrix, ids)
+    train = _likes([(f"u{i}", f"own{i}") for i in range(4)])
+    debiased.fit(train)
+    centered.fit(train)
+    users = [f"u{i}" for i in range(4)]
+    exclude = {u: {f"own{u[1]}"} for u in users}
+    k = len(ids) - 1
+    before = centered.recommend(users, k, exclude)
+    after = debiased.recommend(users, k, exclude)
+    for u in users:
+        assert before[u].index("hub") <= 1  # the hub is near the top for everyone
+        assert after[u].index("hub") > before[u].index("hub")
+    # it is the restaurant with the largest hub value
+    assert ids[int(np.argmax(debiased.hub))] == "hub"
