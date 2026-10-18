@@ -19,9 +19,13 @@ The app is called WEat — a combination of "we" and "eat".
 
 restaurants.parquet
   business_id (str), name (str), latitude (float), longitude (float),
-  stars (float), review_count (int), categories (str), price_level (int, 1-4),
+  stars (float), review_count (int), categories (str),
+  attributes (struct of Yelp attribute strings; price level is derived from RestaurantsPriceRange2 when loading Postgres),
   hours (JSON str): object keyed by weekday, values "H:M-H:M" (minutes not zero-padded);
-    days the restaurant is closed or unlisted are null; whole field null for 318 restaurants with no hours
+    days the restaurant is closed or unlisted are null; whole field null for 318 restaurants with no hours,
+  is_open (bool): open in the dataset snapshot; 2,453 open, 1,449 closed. Not filtered: closed restaurants stay in
+    every offline step (embeddings, splits, evaluation)
+  Rows are sorted by business_id, the same order as business_ids.txt.
 
 reviews.parquet
   review_id (str), user_id (str), business_id (str),
@@ -122,7 +126,7 @@ The `--normalization raw` and `zscore` options exist in `src/group_eval.py`, but
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.
-- `is_open` isn't used: 1,449 of the 3,902 restaurants are marked closed in the dataset snapshot and remain in the catalog and in every candidate set.
+- Closed restaurants: 1,449 of the 3,902 restaurants are marked closed (`is_open`) in the dataset snapshot. They stay in all offline evaluation on purpose, because the held-out reviews are historical, so they appear in every evaluation candidate set. User-facing paths are to exclude them by default; that isn't built yet, and the Postgres loader doesn't load `is_open` yet.
 - Groups are co-rating groups: strangers who liked the same place within 30 days, not real dining parties. Targets skew toward popular restaurants, and the same targets appear in both val and test groups.
 - Possible small target-embedding leak: in 1,672 of the 7,008 val groups, a member's own review of the target is among the reviews encoded into the target's embedding. Within the low and mid target-popularity terciles, flagged and unflagged groups showed no significant hit@10 difference for any content strategy, but an effect of about 0.005 is not ruled out.
 - Groups share targets (handled by the cluster bootstrap) and members (up to 10 groups per user, not clustered), so the CIs are slightly optimistic.
