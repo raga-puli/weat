@@ -339,3 +339,52 @@ def test_short_categories():
     assert page.short_categories("Restaurants, Mexican, Food, Tacos") == "Mexican, Tacos"
     assert page.short_categories("A, B, C, D, Restaurants") == "A, B, C, …"
     assert page.short_categories(None) == "" and page.short_categories("") == ""
+
+
+def test_cohesion_reading_uses_val_terciles():
+    assert (page.COHESION_LOW, page.COHESION_HIGH) == (0.18, 0.32)
+    assert page.cohesion_reading(0.05).startswith("Very different tastes")
+    assert page.cohesion_reading(0.18).startswith("Partly overlapping")
+    assert page.cohesion_reading(0.319).startswith("Partly overlapping")
+    assert page.cohesion_reading(0.32).startswith("Similar tastes")
+
+
+def test_metric_deltas_b_minus_a():
+    a = {"group_utility_predicted": 0.86, "worst_member_predicted": 0.76, "fairness_gap_predicted": 0.18}
+    b = {"group_utility_predicted": 0.84, "worst_member_predicted": 0.80, "fairness_gap_predicted": 0.09}
+    d = page.metric_deltas(a, b)
+    assert d == pytest.approx({"group_utility_predicted": -0.02, "worst_member_predicted": 0.04,
+                               "fairness_gap_predicted": -0.09})
+
+
+def test_top_member_rows_collapses_and_prefixes_rank():
+    result = {"restaurants": [
+        _r("a", "Taco Place", 0.9, {"u1": 0.9, "u2": 0.7}),
+        _r("b", "QDOBA", 0.8, {"u1": 0.8, "u2": 0.6}),
+        _r("c", "QDOBA", 0.7, {"u1": 0.1, "u2": 0.1}),
+        *[_r(f"x{i}", f"Place {i}", 0.5, {"u1": 0.5, "u2": 0.5}) for i in range(5)],
+    ]}
+    rows = page.top_member_rows(result, page.member_labels(["u1", "u2"]))
+    assert len(rows) == 5
+    assert rows[0] == {"restaurant": "1. Taco Place", "M1": 0.9, "M2": 0.7}
+    assert rows[1]["restaurant"] == "2. QDOBA (2 locations)" and rows[1]["M1"] == 0.8  # best location's scores
+    assert rows[2]["restaurant"] == "4. Place 0"
+
+
+def test_map_points_marks_list_membership_and_skips_missing_coords():
+    def loc(bid, lat=39.95, lon=-75.16):
+        return {"business_id": bid, "name": bid, "lat": lat, "lon": lon}
+
+    a = {"restaurants": [loc("a"), loc("both"), loc("nocoords", lat=None)]}
+    b = {"restaurants": [loc("both"), loc("b")]}
+    points = {p["name"]: p for p in page.map_points([a, b])}
+    assert set(points) == {"a", "both", "b"}
+    assert {n: p["list"] for n, p in points.items()} == {"a": "A", "both": "both", "b": "B"}
+    assert points["both"]["color"] == page.MAP_COLORS["both"]
+    assert {p["list"] for p in page.map_points([a])} == {"A"}
+
+
+def test_member_score_bounds():
+    res = {"restaurants": [{"member_scores": {"u1": -1.2, "u2": 0.4}}, {"member_scores": {"u1": 2.5}}]}
+    assert page.member_score_bounds([res], "rank") == (0.0, 1.0)
+    assert page.member_score_bounds([res], "zscore") == (-1.2, 2.5)
