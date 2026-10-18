@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from src import interfaces
-from src.aggregate import LAMBDA, STRATEGIES as AGGREGATORS, fairness_repeated, normalize
+from src.aggregate import LAMBDA, TAU, STRATEGIES as AGGREGATORS, fairness_repeated, normalize
 from src.groups import GROUPS
 from src import recommend as recommend_lib  # not `recommend`: that's the POST /recommend handler below
 from src.recommend import ContentBasedCentered, ContentBasedDebiased
@@ -110,6 +110,8 @@ class GroupParams(BaseModel):
     members: list[str] = Field(min_length=MIN_MEMBERS, max_length=MAX_MEMBERS)
     norm: Norm = "rank"
     lam: float = Field(LAMBDA, ge=0)
+    tau: float = Field(TAU, gt=0, description="fairness_repeated temperature; default is the "
+                                              "pre-registered evaluation value")
     k: int = Field(10, ge=1, le=50)
     exclude_visited: bool = True
     include_closed: bool = False
@@ -188,7 +190,7 @@ def recommend_group(params: GroupParams, strategy: str, model, restaurants, user
     history = None
     if strategy == "fairness_repeated":
         picks, hist, weights = fairness_repeated(scores, excluded, params.k, norm=params.norm,
-                                                 return_weights=True)
+                                                 tau=params.tau, return_weights=True)
         aggregate_scores = [float(weights[t] @ S[:, p]) for t, p in enumerate(picks)]
         history = [
             {
@@ -230,7 +232,7 @@ def recommend_group(params: GroupParams, strategy: str, model, restaurants, user
     result = {
         "strategy": strategy,
         "norm": params.norm,
-        "params": {"lam": params.lam, "k": params.k, "exclude_visited": params.exclude_visited,
+        "params": {"lam": params.lam, "tau": params.tau, "k": params.k, "exclude_visited": params.exclude_visited,
                    "include_closed": params.include_closed},
         "members": members,
         "cohesion": _cohesion(tastes),

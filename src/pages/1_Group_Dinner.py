@@ -147,22 +147,92 @@ def top_member_rows(result: dict, labels: dict[str, str], top: int = 5) -> list[
 
 
 MAP_COLORS = {"A": "#1f77b4", "B": "#ff7f0e", "both": "#9467bd"}
+# Okabe-Ito: colorblind-safe, clearly distinct hues; one per member (max 6).
+MEMBER_PALETTE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9"]
+TAU_OPTIONS = [0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0, 3.0]
+TAU_UI_DEFAULT = 0.3
+
+
+def member_colors(labels: dict[str, str]) -> dict[str, str]:
+    """Member label (M1..Mn) -> its palette color, in order."""
+    return {label: MEMBER_PALETTE[i % len(MEMBER_PALETTE)] for i, label in enumerate(labels.values())}
+
+
+def hex_to_rgba(color: str, alpha: int = 220) -> list[int]:
+    color = color.lstrip("#")
+    return [int(color[i:i + 2], 16) for i in (0, 2, 4)] + [alpha]
+
+
+def member_bars_svg(values: list[float], colors: list[str], y_min: float = 0.0, y_max: float = 1.0,
+                    bar_width: int = 26, height: int = 40) -> str:
+    """A tiny bar chart as an SVG data URI: one bar per member in that member's
+    color on a fixed [y_min, y_max] axis, with the value printed above each bar."""
+    import base64
+
+    label_h, gap = 11, 4
+    width = len(values) * (bar_width + gap)
+    span = (y_max - y_min) or 1.0
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'viewBox="0 0 {width} {height}">']
+    for i, (value, color) in enumerate(zip(values, colors)):
+        frac = min(max((float(value) - y_min) / span, 0.0), 1.0)
+        bar_h = frac * (height - label_h)
+        x = i * (bar_width + gap)
+        y = height - bar_h
+        parts.append(f'<rect x="{x}" y="{y:.1f}" width="{bar_width}" height="{bar_h:.1f}" fill="{color}"/>')
+        parts.append(f'<text x="{x + bar_width / 2}" y="{max(y - 2, 9):.1f}" font-size="9" '
+                     f'font-family="sans-serif" text-anchor="middle" fill="#333">{float(value):.2f}</text>')
+    parts.append("</svg>")
+    return "data:image/svg+xml;base64," + base64.b64encode("".join(parts).encode()).decode()
 
 
 def map_points(results: list[dict]) -> list[dict]:
     """One point per recommended location with coordinates. With two results,
-    `list` is "A", "B" or "both"; with one, always "A"."""
-    lists = [{r["business_id"]: r for r in res["restaurants"]} for res in results]
+    `list` is "A", "B" or "both"; with one, always "A". Ranks are 1-based
+    positions in each list; `tooltip` is ready to show."""
+    lists = [{r["business_id"]: (rank, r) for rank, r in enumerate(res["restaurants"], 1)} for res in results]
     points = []
     for business_id in dict.fromkeys(b for lst in lists for b in lst):
         in_lists = [i for i, lst in enumerate(lists) if business_id in lst]
-        r = lists[in_lists[0]][business_id]
+        r = lists[in_lists[0]][business_id][1]
         if r.get("lat") is None or r.get("lon") is None:
             continue
         which = "both" if len(in_lists) == 2 else ("A", "B")[in_lists[0]]
+        ranks = {("A", "B")[i]: lists[i][business_id][0] for i in in_lists}
+        rank_text = " · ".join(f"{k} #{v}" for k, v in ranks.items()) if len(lists) == 2 else f"#{ranks['A']}"
         points.append({"lat": float(r["lat"]), "lon": float(r["lon"]), "name": r.get("name"),
-                       "list": which, "color": MAP_COLORS[which]})
+                       "list": which, "color": MAP_COLORS[which], "rgba": hex_to_rgba(MAP_COLORS[which]),
+                       "rank_a": ranks.get("A"), "rank_b": ranks.get("B"),
+                       "tooltip": f"{r.get('name')} ({rank_text})"})
     return points
+
+
+TILE_PX = 512  # deck.gl / Mapbox zoom convention: the world is 512 px wide at zoom 0
+
+
+def fit_view(points: list[dict], width_px: int = 1000, height_px: int = 380, padding: float = 0.15,
+             max_zoom: float = 15.0) -> dict:
+    """Center and Web-Mercator zoom (deck.gl convention) that fit every point in
+    a width x height map, leaving `padding` (a fraction of each side's span)."""
+    import math
+
+    if not points:
+        return {"latitude": 39.9526, "longitude": -75.1652, "zoom": 11.0}  # Philadelphia
+    lats = [p["lat"] for p in points]
+    lons = [p["lon"] for p in points]
+
+    def merc_y(lat):
+        return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+    lon_span = (max(lons) - min(lons)) * (1 + 2 * padding)
+    y_span = (merc_y(max(lats)) - merc_y(min(lats))) * (1 + 2 * padding)
+    zooms = [max_zoom]
+    if lon_span > 0:
+        zooms.append(math.log2(width_px * 360 / (TILE_PX * lon_span)))
+    if y_span > 0:
+        zooms.append(math.log2(height_px * 2 * math.pi / (TILE_PX * y_span)))
+    return {"latitude": (min(lats) + max(lats)) / 2, "longitude": (min(lons) + max(lons)) / 2,
+            "zoom": round(min(zooms), 2)}
 
 
 def member_score_bounds(results: list[dict], norm: str) -> tuple[float, float]:
@@ -223,6 +293,8 @@ def main() -> None:
     # ---- sidebar: group -----------------------------------------------------------
     sb = st.sidebar
     sb.header("Group")
+    sb.subheader("Next sample")
+    sb.caption("Applies when you sample a new group.")
     cohesion_choices = ["any", "high", "low"]
     n = sb.slider("Group size", MIN_MEMBERS, MAX_MEMBERS, int(params.get("n", 4)))
     default_cohesion = params.get("cohesion", "low")
@@ -272,6 +344,12 @@ def main() -> None:
     if "fairness" in (strategy_a, strategy_b):
         lam = sb.slider("λ (fairness)", 0.0, 1.0, 0.5, 0.05,
                         help="fairness score = mean − λ·(max − min) over members")
+    tau = None
+    if "fairness_repeated" in (strategy_a, strategy_b):
+        tau = sb.select_slider(
+            "τ (fairness_repeated)", options=TAU_OPTIONS, value=TAU_UI_DEFAULT,
+            help="τ=0.1 is the pre-registered evaluation default; 0.3 performed better per dinner on validation.",
+        )
     k = sb.number_input("Results (k)", min_value=1, max_value=50, value=10)
     include_closed = sb.toggle("Include closed restaurants", value=False)
 
@@ -290,7 +368,10 @@ def main() -> None:
         return
     labels = member_labels(members)
 
+    colors = member_colors(labels)
     payload = {"members": members, "norm": norm, "lam": lam, "k": int(k), "include_closed": include_closed}
+    if tau is not None:
+        payload["tau"] = tau
     if compare:
         payload["strategies"] = [strategy_a, strategy_b]
     else:
@@ -312,14 +393,35 @@ def main() -> None:
     c2.markdown(f"**{cohesion_reading(cohesion)}**  \n{state.get('sample_note', '')} · {len(members)} members")
     for col, user in zip(st.columns(len(members)), state.get("profiles", [])):
         with col:
-            st.markdown(f"**{labels[user['user_id']]}** · `{user['user_id'][:10]}…`")
+            label = labels[user["user_id"]]
+            st.markdown(
+                f'<span style="display:inline-block;width:0.8em;height:0.8em;border-radius:2px;'
+                f'background:{colors[label]};margin-right:0.35em"></span>'
+                f'<b style="color:{colors[label]}">{label}</b> · <code>{user["user_id"][:10]}…</code>',
+                unsafe_allow_html=True,
+            )
             st.caption("Top-rated: " + "; ".join(f"{p['name']} ({p['stars']:.0f}★)" for p in user["profile"]))
 
     y_min, y_max = member_score_bounds(results, norm)
-    member_bars = st.column_config.BarChartColumn(
-        " · ".join(labels.values()), y_min=y_min, y_max=y_max, width=110,
-        help=f"Each member's predicted score ({norm}), M1 to Mn left to right",
+    color_list = [colors[label] for label in labels.values()]
+    n_members = len(labels)
+    member_bars = st.column_config.ImageColumn(
+        " · ".join(labels.values()), width=max(110, n_members * 30 + 10),
+        help=f"Each member's predicted score ({norm}) on a fixed {y_min:g}–{y_max:g} scale, "
+             "in the member colors above",
     )
+
+    def bars_column(table: pd.DataFrame) -> list[str]:
+        return [member_bars_svg(row, color_list, y_min, y_max)
+                for row in table[list(labels.values())].values.tolist()]
+
+    def score_column(res: dict):
+        if res["strategy"] == "fairness_repeated":
+            return st.column_config.NumberColumn(
+                "dinner score (weighted)", format="%.3f", width=150,
+                help="The weighted group score when that dinner was chosen (members served worst so far "
+                     "weigh more). The list is in dinner order, not sorted by this score.")
+        return st.column_config.NumberColumn("score", format="%.3f", width=55)
 
     def metrics(summary: dict, deltas: dict | None = None) -> None:
         m1, m2, m3 = st.columns(3)
@@ -349,19 +451,20 @@ def main() -> None:
                 st.markdown(f"### {'A' if i == 0 else 'B'}: {res['strategy']}")
                 metrics(res["summary"], deltas if i == 1 else None)
                 table = pd.DataFrame(display_rows(res, other, labels))
-                table["members"] = table[list(labels.values())].values.tolist()
+                table["members"] = bars_column(table)
                 styled = table.style.apply(
                     lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row["in_both"] else ""
                                  for _ in row],
                     axis=1,
                 )
-                st.dataframe(styled, hide_index=True, width="stretch", column_config={
+                st.dataframe(styled, hide_index=True, width="stretch", row_height=46,
+                             height=(len(table) + 1) * 46 + 3, column_config={
                     "in_both": None,
                     "rank": st.column_config.NumberColumn("#", width=30),
-                    "name": st.column_config.TextColumn("name", width=170),
-                    "categories": st.column_config.TextColumn("categories", width=130),
+                    "name": st.column_config.TextColumn("name", width=150),
+                    "categories": st.column_config.TextColumn("categories", width=110),
                     "price": st.column_config.TextColumn("price", width=45),
-                    "score": st.column_config.NumberColumn("score", format="%.3f", width=55),
+                    "score": score_column(res),
                     "members": member_bars,
                     **{label: None for label in labels.values()},
                 })
@@ -376,24 +479,36 @@ def main() -> None:
             st.dataframe(table[["rank", "name", "categories", "price", "score"]], hide_index=True,
                          width="stretch", column_config={
                              "rank": st.column_config.NumberColumn("#", width=30),
-                             "score": st.column_config.NumberColumn("score", format="%.3f"),
+                             "score": score_column(res),
                          })
         with right:
             st.markdown("**Top 5: each member's predicted score**")
             chart = pd.DataFrame(top_member_rows(res, labels)).set_index("restaurant")
-            st.bar_chart(chart, stack=False, horizontal=True, height=320,
+            st.bar_chart(chart, stack=False, horizontal=True, height=320, color=color_list,
                          x_label=f"predicted score ({norm})", y_label="")
         per_dinner(res)
 
     # map
-    points = pd.DataFrame(map_points(results))
+    import pydeck as pdk
+
+    point_list = map_points(results)
     st.subheader("Map")
-    if points.empty:
+    if not point_list:
         st.caption("No coordinates for these restaurants.")
     else:
-        st.map(points, latitude="lat", longitude="lon", color="color", size=40, height=360)
-        if compare:
-            st.caption("Blue: only in A · orange: only in B · purple: in both.")
+        layer = pdk.Layer(
+            "ScatterplotLayer", data=pd.DataFrame(point_list), get_position="[lon, lat]",
+            get_fill_color="rgba", get_line_color=[255, 255, 255], line_width_min_pixels=1.5, stroked=True,
+            get_radius=90, radius_min_pixels=8, radius_max_pixels=16, pickable=True,
+        )
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=pdk.ViewState(**fit_view(point_list)),
+                                 tooltip={"text": "{tooltip}"}, map_style=None), height=380)
+        legend = [("A", f"only in A ({strategy_a})"), ("B", f"only in B ({strategy_b})"), ("both", "in both")] \
+            if compare else [("A", res["strategy"])]
+        st.markdown(" ".join(
+            f'<span style="display:inline-block;width:0.75em;height:0.75em;border-radius:50%;'
+            f'background:{MAP_COLORS[key]};margin:0 0.3em 0 0.9em"></span>{text}' for key, text in legend
+        ) + " · hover a pin for name and rank", unsafe_allow_html=True)
 
     with st.expander("How this works", expanded=False):
         st.markdown(

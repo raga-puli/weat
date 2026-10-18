@@ -388,3 +388,84 @@ def test_member_score_bounds():
     res = {"restaurants": [{"member_scores": {"u1": -1.2, "u2": 0.4}}, {"member_scores": {"u1": 2.5}}]}
     assert page.member_score_bounds([res], "rank") == (0.0, 1.0)
     assert page.member_score_bounds([res], "zscore") == (-1.2, 2.5)
+
+
+@pytest.mark.parametrize("tau", [0.1, 3.0])
+def test_tau_reaches_fairness_repeated(client, tau):
+    from src.aggregate import fairness_repeated
+
+    body = _post(client, "/group/recommend", strategy="fairness_repeated", k=4, tau=tau,
+                 include_closed=True, exclude_visited=False).json()
+    assert body["params"]["tau"] == tau
+    scores = np.stack([FAKE_MODEL.scores_for(FAKE_MODEL.taste[u]) for u in ["u1", "u3"]])
+    _, _, weights = fairness_repeated(scores, np.zeros(8, dtype=bool), 4, tau=tau, return_weights=True)
+    got = [[h["member_weights"][u] for u in ["u1", "u3"]] for h in body["history"]]
+    np.testing.assert_allclose(got, weights, atol=1e-9)
+
+
+def test_tau_default_and_validation(client):
+    from src.aggregate import TAU
+
+    body = _post(client, "/group/recommend", strategy="fairness_repeated", k=3).json()
+    assert body["params"]["tau"] == TAU == 0.1
+    assert _post(client, "/group/recommend", strategy="fairness_repeated", tau=0).status_code == 422
+
+
+def test_member_colors_distinct_and_ordered():
+    labels = page.member_labels([f"u{i}" for i in range(6)])
+    colors = page.member_colors(labels)
+    assert list(colors) == ["M1", "M2", "M3", "M4", "M5", "M6"]
+    assert len(set(colors.values())) == 6
+    assert colors["M1"] == page.MEMBER_PALETTE[0]
+    assert page.hex_to_rgba("#0072B2") == [0, 114, 178, 220]
+
+
+def test_member_bars_svg_heights_colors_and_labels():
+    import base64
+
+    uri = page.member_bars_svg([0.0, 0.5, 1.0], ["#111111", "#222222", "#333333"], height=41)
+    assert uri.startswith("data:image/svg+xml;base64,")
+    svg = base64.b64decode(uri.split(",", 1)[1]).decode()
+    assert svg.count("<rect") == 3 and svg.count("<text") == 3
+    for color in ("#111111", "#222222", "#333333"):
+        assert f'fill="{color}"' in svg
+    assert ">0.00<" in svg and ">0.50<" in svg and ">1.00<" in svg
+    # honest fixed axis: bar height is proportional to the value (41 px minus an 11 px label band)
+    assert 'height="0.0"' in svg and 'height="15.0"' in svg and 'height="30.0"' in svg
+    # values outside the axis are clipped, not rescaled
+    clipped = base64.b64decode(page.member_bars_svg([1.7], ["#000000"], height=41).split(",", 1)[1]).decode()
+    assert 'height="30.0"' in clipped and ">1.70<" in clipped
+
+
+def test_tau_ui_options():
+    assert page.TAU_UI_DEFAULT == 0.3 and page.TAU_UI_DEFAULT in page.TAU_OPTIONS
+    assert page.TAU_OPTIONS[0] == 0.05 and page.TAU_OPTIONS[-1] == 3.0
+    assert page.TAU_OPTIONS == sorted(page.TAU_OPTIONS) and 0.1 in page.TAU_OPTIONS
+
+
+def test_map_points_ranks_and_tooltips():
+    def loc(bid):
+        return {"business_id": bid, "name": f"N-{bid}", "lat": 39.95, "lon": -75.16}
+
+    a = {"restaurants": [loc("a"), loc("both")]}
+    b = {"restaurants": [loc("x"), loc("y"), loc("both")]}
+    points = {p["name"]: p for p in page.map_points([a, b])}
+    assert points["N-both"]["tooltip"] == "N-both (A #2 · B #3)"
+    assert points["N-a"]["tooltip"] == "N-a (A #1)" and points["N-y"]["tooltip"] == "N-y (B #2)"
+    assert points["N-both"]["rgba"] == page.hex_to_rgba(page.MAP_COLORS["both"])
+    single = page.map_points([a])
+    assert [p["tooltip"] for p in single] == ["N-a (#1)", "N-both (#2)"]
+
+
+def test_fit_view_contains_points_and_zooms_out_for_spread():
+    tight = [{"lat": 39.95, "lon": -75.17}, {"lat": 39.96, "lon": -75.16}]
+    wide = [{"lat": 39.90, "lon": -75.25}, {"lat": 40.05, "lon": -75.05}]
+    vt, vw = page.fit_view(tight), page.fit_view(wide)
+    assert vw["zoom"] < vt["zoom"]
+    assert 39.90 <= vw["latitude"] <= 40.05 and -75.25 <= vw["longitude"] <= -75.05
+    assert page.fit_view([{"lat": 39.95, "lon": -75.16}])["zoom"] == 15.0  # single point: capped
+    assert page.fit_view([])["zoom"] == 11.0
+    # the padded extent fits the map at deck.gl's 512-px zoom convention (wide case)
+    assert page.TILE_PX == 512
+    lon_px = (0.20 * 1.3) * page.TILE_PX * 2 ** vw["zoom"] / 360
+    assert lon_px <= 1000 + 1
