@@ -17,3 +17,6 @@ venv/
 
 # secrets
 .env
+
+# Claude Code local settings
+.claude/
