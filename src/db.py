@@ -5,6 +5,7 @@
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -68,11 +69,26 @@ def parse_categories(value) -> list[str] | None:
     return [c.strip() for c in str(value).split(",") if c.strip()]
 
 
-def _as_dict(value) -> dict | None:
-    """Parquet struct -> dict without the keys this business doesn't have."""
+def _as_dict(value, business_id: str | None = None) -> dict | None:
+    """Parquet struct or JSON string -> dict without the keys this business doesn't have, or None.
+
+    prep.py writes hours with to_json(), so it arrives as a str; attributes arrives as a struct (dict).
+    Null, "", "null" and dicts with no non-null keys all become None.
+    """
     if _missing(value):
         return None
-    return {k: v for k, v in dict(value).items() if v is not None}
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"business_id {business_id}: malformed JSON {value[:80]!r} ({e})") from e
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError(f"business_id {business_id}: expected a JSON object, got {type(value).__name__}")
+    return {k: v for k, v in dict(value).items() if v is not None} or None
 
 
 def _rows() -> list[tuple]:
@@ -91,8 +107,8 @@ def _rows() -> list[tuple]:
 
     rows = []
     for r in restaurants.to_dict("records"):
-        attributes = _as_dict(r.get("attributes"))
-        hours = _as_dict(r.get("hours"))
+        attributes = _as_dict(r.get("attributes"), r["business_id"])
+        hours = _as_dict(r.get("hours"), r["business_id"])
         rows.append(
             (
                 r["business_id"],

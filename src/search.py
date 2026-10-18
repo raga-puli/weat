@@ -224,7 +224,8 @@ def load_frame() -> tuple[pd.DataFrame, np.ndarray]:
         restaurants = pd.read_parquet(interfaces.RESTAURANTS)
         emb, business_ids = interfaces.load_embeddings()
         row_of = {bid: i for i, bid in enumerate(business_ids)}
-        attributes = restaurants["attributes"].map(_as_dict)
+        bids = restaurants["business_id"]
+        attributes = [_as_dict(a, b) for a, b in zip(restaurants["attributes"], bids)]
         frame = pd.DataFrame(
             {
                 "business_id": restaurants["business_id"],
@@ -236,7 +237,7 @@ def load_frame() -> tuple[pd.DataFrame, np.ndarray]:
                 "price_level": [parse_price_level((a or {}).get("RestaurantsPriceRange2")) for a in attributes],
                 "categories": restaurants["categories"].map(lambda c: parse_categories(c) or []),
                 "attributes": attributes,
-                "hours": restaurants["hours"].map(_as_dict) if "hours" in restaurants else None,
+                "hours": [_as_dict(h, b) for h, b in zip(restaurants["hours"], bids)] if "hours" in restaurants else None,
             }
         )
         _frame = (frame.reset_index(drop=True), emb[[row_of[b] for b in frame["business_id"]]])
