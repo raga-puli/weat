@@ -106,6 +106,10 @@ fairness_repeated's per-restaurant fairness gap by cohesion tercile (2,336 group
 
 The two definitions measure different things. Per-restaurant metrics ask whether each dinner works for everyone; member-mean metrics ask whether everyone is served equally across a sequence of dinners. fairness_repeated is designed for the second: it spreads its picks across members' tastes, so individual restaurants favor some members over others while the totals even out. It has the smallest cumulative gap and the largest per-dinner gap of the content strategies, and the difference grows as groups diverge. For a one-off dinner, least_misery is the better fit; for a group that eats together repeatedly, spreading picks across members is. τ=0.1 is not just more uneven across dinners; it is worse at each dinner. In low-cohesion groups its per-restaurant worst member is 0.645 [0.638, 0.652] vs. 0.753 [0.749, 0.757] at τ=0.3, and its per-restaurant fairness gap is 0.330 vs. 0.202 (paired difference +0.128 [0.123, 0.133], cluster bootstrap). From τ=0.3 upward, per-dinner metrics are close to or slightly better than average, so the per-dinner cost of sequential fairness comes mostly from setting τ too low.
 
+### Compromise picks in low-cohesion groups
+
+In low-cohesion groups, aggregation surfaces compromise restaurants that bridge members' tastes (e.g. a sample group of ramen, café, Chinese and vegan diners received mostly Mexican/Latin places that each member ranked in their top ~20%). This is aggregation working as intended, not an individual-model artifact.
+
 ### Pre-registered for test
 
 Pre-registered 2026-10-17, before any test-split evaluation: fairness_repeated with τ=0.3 yields a higher worst-member predicted percentile than least_misery in low-cohesion groups, at a smaller group-score cost. τ=0.1 remains the original pre-registered default and will be reported regardless of outcome.
