@@ -203,6 +203,30 @@ On predicted scores, yes: in high-cohesion groups every strategy is within about
 - Low-cohesion hit@10 cells rest on 10–19 hits each, so those comparisons are fragile.
 - **Amendment:** the τ=0.3 configuration was missing from the original frozen list in error and was added to `docs/frozen_configs.md` after the four other group test runs, then run once. This doesn't involve choosing a configuration from test results: τ=0.3 and the hypothesis it tests were fixed in the 2026-10-17 pre-registration, before any test-split evaluation, and the τ=0.1 results are reported alongside regardless.
 
+## Group API and page
+
+The `/group` API (`src/api/routes_group.py`) serves `ContentBasedDebiased` with each user's whole train history (users with 5+ reviews), scored in numpy through `src/aggregate.py`.
+
+| endpoint | what it does |
+| --- | --- |
+| `GET /group/users/sample?n=4&cohesion=any\|high\|low&seed=42` | n val users with their top-rated places; high/low draws them from a real val group in that half of the cohesion distribution |
+| `GET /group/users/profiles?user_ids=…` | top-rated places for given user IDs |
+| `POST /group/recommend` | one strategy's list: members (2–6), strategy, norm (rank/zscore/raw), lam, tau, k, exclude_visited, include_closed |
+| `POST /group/compare` | the same for two strategies, plus their overlap |
+| `GET /health` | liveness |
+
+To run it (repo root, `.venv` active):
+
+```
+python -m src.recommend build-cache --model ContentBasedDebiased   # optional: ~90 s once; otherwise the first request fits and caches (~110 s)
+uvicorn src.api.main:app                                           # API on :8000, docs at /docs
+streamlit run src/app.py                                           # UI on :8501, "Group Dinner" page
+```
+
+- **τ default:** the API's `tau` defaults to 0.1, the pre-registered evaluation setting. The Group Dinner page defaults to 0.3, which performed better per dinner on validation (see "τ sensitivity").
+- **Closed restaurants** are excluded by default (`include_closed=false`), and so is anything a member already reviewed (`exclude_visited=true`).
+- **Chains:** the page asks for k + 5 results and collapses repeat locations of a chain into one row, "(N locations)". fairness_repeated is a dinner sequence, so its list is shown uncollapsed, with repeat locations labelled "(another location)".
+
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.

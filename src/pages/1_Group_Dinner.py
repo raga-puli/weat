@@ -59,12 +59,14 @@ def collapse_chains(restaurants: list[dict]) -> list[dict]:
     out, by_name = [], {}
     for rank, r in enumerate(restaurants, 1):
         name = r.get("name") or r["business_id"]
+        ids = list(r.get("business_ids", [r["business_id"]]))  # already-collapsed rows keep theirs
         if name in by_name:
             row = by_name[name]
-            row["locations"] += 1
-            row["business_ids"].append(r["business_id"])
+            row["locations"] += r.get("locations", 1)
+            row["business_ids"].extend(ids)
             continue
-        row = {**r, "rank": rank, "name": name, "locations": 1, "business_ids": [r["business_id"]]}
+        row = {**r, "rank": r.get("rank", rank), "name": name,
+               "locations": r.get("locations", 1), "business_ids": ids}
         by_name[name] = row
         out.append(row)
     for row in out:
@@ -80,9 +82,10 @@ def display_rows(result: dict, other_ids: set[str], labels: dict[str, str]) -> l
     one column per member (by label), and whether it is also in the other list
     (any of a collapsed row's locations counts)."""
     rows = []
-    for r in collapse_chains(result["restaurants"]):
+    for r in list_rows(result):
         row = {
             "rank": r["rank"],
+            "api_rank": r.get("api_rank", r["rank"]),
             "name": r["display_name"],
             "categories": short_categories(r.get("categories")),
             "price": format_price(r.get("price_level")),
@@ -98,7 +101,8 @@ def display_rows(result: dict, other_ids: set[str], labels: dict[str, str]) -> l
 def dinner_rows(result: dict, labels: dict[str, str]) -> list[dict]:
     """fairness_repeated per-dinner view: the pick, then each member's score
     and weight for that dinner."""
-    names = {r["business_id"]: r.get("name") or r["business_id"] for r in result["restaurants"]}
+    names = {r["business_id"]: r.get("display_name") or r.get("name") or r["business_id"]
+             for r in list_rows(result)}
     rows = []
     for h in result.get("history", []):
         row = {"dinner": h["dinner"], "pick": names.get(h["business_id"], h["business_id"])}
@@ -107,6 +111,70 @@ def dinner_rows(result: dict, labels: dict[str, str]) -> list[dict]:
             row[f"{label} weight"] = round(float(h["member_weights"][member]), 3)
         rows.append(row)
     return rows
+
+
+EXTRA_FETCH = 5  # ask the API for k + 5 so chain collapsing still leaves k distinct names
+
+
+def sequence_rows(restaurants: list[dict]) -> list[dict]:
+    """fairness_repeated: a dinner sequence, shown as-is (no collapsing or
+    renumbering). A later location of a chain already in the sequence is
+    labelled "(another location)"."""
+    seen, rows = set(), []
+    for i, r in enumerate(restaurants, 1):
+        name = r.get("name") or r["business_id"]
+        rows.append({**r, "rank": i, "api_rank": i, "name": name, "locations": 1,
+                     "business_ids": [r["business_id"]],
+                     "display_name": f"{name} (another location)" if name in seen else name})
+        seen.add(name)
+    return rows
+
+
+def list_rows(result: dict) -> list[dict]:
+    """The rows a list shows: chains collapsed, except fairness_repeated (a sequence)."""
+    if result.get("strategy") == "fairness_repeated":
+        rows = result["restaurants"]
+        return rows if rows and "display_name" in rows[0] else sequence_rows(rows)
+    return collapse_chains(result["restaurants"])
+
+
+def trim_result(result: dict, k: int) -> dict:
+    """The API returned k + EXTRA_FETCH restaurants. Collapse chains, keep the
+    first k distinct names, renumber ranks 1..k (`api_rank` keeps the API's),
+    and recompute the predicted summary over the kept rows exactly as the API
+    does (each member's mean over the list; group = mean, worst = min, gap =
+    max - min), using each kept row's best location.
+
+    fairness_repeated is a dinner sequence, so it is never collapsed or
+    renumbered: the first k dinners are kept as-is (identical to what the
+    algorithm picks for k, since each dinner depends only on earlier ones),
+    with repeat chain locations labelled. Its history keeps those k dinners."""
+    if result.get("strategy") == "fairness_repeated":
+        kept = sequence_rows(result["restaurants"][:k])
+    else:
+        kept = [{**r, "api_rank": r["rank"], "rank": i}
+                for i, r in enumerate(collapse_chains(result["restaurants"])[:k], 1)]
+    members = list(result["members"])
+    means = [sum(float(r["member_scores"][m]) for r in kept) / len(kept) for m in members] if kept else []
+    summary = dict(result["summary"])
+    if means:
+        summary.update({
+            "group_utility_predicted": sum(means) / len(means),
+            "worst_member_predicted": min(means),
+            "fairness_gap_predicted": max(means) - min(means),
+            "member_means_predicted": dict(zip(members, means)),
+        })
+    trimmed = {**result, "restaurants": kept, "summary": summary, "api_k": len(result["restaurants"])}
+    if "history" in result:
+        trimmed["history"] = list(result["history"][:k])  # dinners 1..k, in order
+    return trimmed
+
+
+def overlap_count(rows_a: list[dict], rows_b: list[dict]) -> int:
+    """Rows of list A that also appear in list B, counting any location of a
+    collapsed chain (lists as returned by trim_result)."""
+    ids_b = {b for r in rows_b for b in r.get("business_ids", [r["business_id"]])}
+    return sum(bool(set(r.get("business_ids", [r["business_id"]])) & ids_b) for r in rows_a)
 
 
 # Val-group cohesion terciles under the API's definition (mean pairwise cosine of
@@ -139,7 +207,7 @@ def top_member_rows(result: dict, labels: dict[str, str], top: int = 5) -> list[
     """Per-member scores for the first `top` (chain-collapsed) restaurants;
     restaurant labels are prefixed with their rank so they sort in rank order."""
     rows = []
-    for r in collapse_chains(result["restaurants"])[:top]:
+    for r in list_rows(result)[:top]:
         row = {"restaurant": f"{r['rank']}. {r['display_name']}"}
         row.update({label: float(r["member_scores"][m]) for m, label in labels.items()})
         rows.append(row)
@@ -187,22 +255,42 @@ def member_bars_svg(values: list[float], colors: list[str], y_min: float = 0.0, 
 
 
 def map_points(results: list[dict]) -> list[dict]:
-    """One point per recommended location with coordinates. With two results,
-    `list` is "A", "B" or "both"; with one, always "A". Ranks are 1-based
-    positions in each list; `tooltip` is ready to show."""
-    lists = [{r["business_id"]: (rank, r) for rank, r in enumerate(res["restaurants"], 1)} for res in results]
+    """One point per list row (at its best location) with coordinates. With two
+    results, `list` is "A", "B" or "both" (a row is in both if any of its chain
+    locations is in the other list); with one, always "A". Ranks are display
+    ranks; the tooltip adds the API rank where it differs."""
+    def ids(r):
+        return set(r.get("business_ids", [r["business_id"]]))
+
+    def rank_of(r, position):
+        shown = r.get("rank", position)
+        api = r.get("api_rank")
+        return shown, (f"#{shown} (API #{api})" if api not in (None, shown) else f"#{shown}")
+
+    rows = [list(res["restaurants"]) for res in results]
+    entries, matched_b = [], set()
+    for pos_a, r in enumerate(rows[0], 1):
+        ranks = {"A": rank_of(r, pos_a)}
+        if len(rows) == 2:
+            for pos_b, rb in enumerate(rows[1], 1):
+                if pos_b not in matched_b and ids(r) & ids(rb):
+                    ranks["B"] = rank_of(rb, pos_b)
+                    matched_b.add(pos_b)
+                    break
+        entries.append((r, ranks))
+    if len(rows) == 2:
+        entries += [(rb, {"B": rank_of(rb, pos_b)}) for pos_b, rb in enumerate(rows[1], 1) if pos_b not in matched_b]
+
     points = []
-    for business_id in dict.fromkeys(b for lst in lists for b in lst):
-        in_lists = [i for i, lst in enumerate(lists) if business_id in lst]
-        r = lists[in_lists[0]][business_id][1]
+    for r, ranks in entries:
         if r.get("lat") is None or r.get("lon") is None:
             continue
-        which = "both" if len(in_lists) == 2 else ("A", "B")[in_lists[0]]
-        ranks = {("A", "B")[i]: lists[i][business_id][0] for i in in_lists}
-        rank_text = " · ".join(f"{k} #{v}" for k, v in ranks.items()) if len(lists) == 2 else f"#{ranks['A']}"
+        which = "both" if len(ranks) == 2 else next(iter(ranks))
+        rank_text = (" · ".join(f"{k} {text}" for k, (_, text) in ranks.items()) if len(rows) == 2
+                     else ranks["A"][1])
         points.append({"lat": float(r["lat"]), "lon": float(r["lon"]), "name": r.get("name"),
                        "list": which, "color": MAP_COLORS[which], "rgba": hex_to_rgba(MAP_COLORS[which]),
-                       "rank_a": ranks.get("A"), "rank_b": ranks.get("B"),
+                       "rank_a": ranks.get("A", (None,))[0], "rank_b": ranks.get("B", (None,))[0],
                        "tooltip": f"{r.get('name')} ({rank_text})"})
     return points
 
@@ -350,7 +438,8 @@ def main() -> None:
             "τ (fairness_repeated)", options=TAU_OPTIONS, value=TAU_UI_DEFAULT,
             help="τ=0.1 is the pre-registered evaluation default; 0.3 performed better per dinner on validation.",
         )
-    k = sb.number_input("Results (k)", min_value=1, max_value=50, value=10)
+    # the API caps k at 50, and the page asks for k + EXTRA_FETCH
+    k = sb.number_input("Results (k)", min_value=1, max_value=50 - EXTRA_FETCH, value=10)
     include_closed = sb.toggle("Include closed restaurants", value=False)
 
     # deep link: ?cohesion=…&seed=…&n=… draws a group once on load
@@ -369,7 +458,8 @@ def main() -> None:
     labels = member_labels(members)
 
     colors = member_colors(labels)
-    payload = {"members": members, "norm": norm, "lam": lam, "k": int(k), "include_closed": include_closed}
+    payload = {"members": members, "norm": norm, "lam": lam, "k": int(k) + EXTRA_FETCH,
+               "include_closed": include_closed}
     if tau is not None:
         payload["tau"] = tau
     if compare:
@@ -382,7 +472,9 @@ def main() -> None:
     except APIError as e:
         show_error(e)
         return
-    results = response["results"] if compare else [response]
+    # collapse chains and keep k distinct names; overlap, deltas and map use these trimmed lists
+    results = [trim_result(r, int(k)) for r in (response["results"] if compare else [response])]
+    overlap = overlap_count(results[0]["restaurants"], results[1]["restaurants"]) if compare else None
 
     # group and cohesion
     cohesion = results[0]["cohesion"]
@@ -415,6 +507,16 @@ def main() -> None:
         return [member_bars_svg(row, color_list, y_min, y_max)
                 for row in table[list(labels.values())].values.tolist()]
 
+    rank_column = st.column_config.NumberColumn(
+        "#", width=30, help="Rank among distinct restaurants (chains collapsed). The API's own rank, which "
+                            "counts every chain location, is in the API # column when it differs.")
+
+    def api_rank_column(table: pd.DataFrame):
+        if (table["api_rank"] == table["rank"]).all():
+            return None  # identical everywhere: hide
+        return st.column_config.NumberColumn("API #", width=45, help="Rank in the API's response, before "
+                                                                     "chain locations were collapsed")
+
     def score_column(res: dict):
         if res["strategy"] == "fairness_repeated":
             return st.column_config.NumberColumn(
@@ -441,9 +543,10 @@ def main() -> None:
                 st.dataframe(pd.DataFrame(dinner_rows(res, labels)), hide_index=True, width="stretch")
 
     if compare:
-        id_sets = [{r["business_id"] for r in res["restaurants"]} for res in results]
+        id_sets = [{b for r in res["restaurants"] for b in r.get("business_ids", [r["business_id"]])}
+                   for res in results]
         st.subheader(f"{strategy_a} vs. {strategy_b}")
-        st.markdown(f"**List overlap: {response['overlap']} of {len(results[0]['restaurants'])}** "
+        st.markdown(f"**List overlap: {overlap} of {len(results[0]['restaurants'])}** "
                     "(highlighted rows appear in both lists)")
         deltas = metric_deltas(results[0]["summary"], results[1]["summary"])
         for i, (col, res, other) in enumerate(zip(st.columns(2), results, reversed(id_sets))):
@@ -460,7 +563,8 @@ def main() -> None:
                 st.dataframe(styled, hide_index=True, width="stretch", row_height=46,
                              height=(len(table) + 1) * 46 + 3, column_config={
                     "in_both": None,
-                    "rank": st.column_config.NumberColumn("#", width=30),
+                    "rank": rank_column,
+                    "api_rank": api_rank_column(table),
                     "name": st.column_config.TextColumn("name", width=150),
                     "categories": st.column_config.TextColumn("categories", width=110),
                     "price": st.column_config.TextColumn("price", width=45),
@@ -476,9 +580,10 @@ def main() -> None:
         left, right = st.columns([3, 2])
         with left:
             table = pd.DataFrame(display_rows(res, set(), labels))
-            st.dataframe(table[["rank", "name", "categories", "price", "score"]], hide_index=True,
+            st.dataframe(table[["rank", "api_rank", "name", "categories", "price", "score"]], hide_index=True,
                          width="stretch", column_config={
-                             "rank": st.column_config.NumberColumn("#", width=30),
+                             "rank": rank_column,
+                             "api_rank": api_rank_column(table),
                              "score": score_column(res),
                          })
         with right:

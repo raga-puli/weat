@@ -110,8 +110,13 @@ class GroupParams(BaseModel):
     members: list[str] = Field(min_length=MIN_MEMBERS, max_length=MAX_MEMBERS)
     norm: Norm = "rank"
     lam: float = Field(LAMBDA, ge=0)
-    tau: float = Field(TAU, gt=0, description="fairness_repeated temperature; default is the "
-                                              "pre-registered evaluation value")
+    tau: float = Field(
+        TAU, gt=0,
+        description="fairness_repeated temperature (member weights = softmax(-cumulative score / tau)). "
+                    "The API default, 0.1, is the pre-registered evaluation setting. The Group Dinner page "
+                    "defaults to 0.3 instead, because 0.3 performed better per dinner on validation "
+                    "(README: τ sensitivity).",
+    )
     k: int = Field(10, ge=1, le=50)
     exclude_visited: bool = True
     include_closed: bool = False

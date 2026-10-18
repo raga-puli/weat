@@ -290,7 +290,7 @@ def test_display_rows_formatting_and_overlap():
     labels = page.member_labels(["u1", "u2"])
     assert labels == {"u1": "M1", "u2": "M2"}
     rows = page.display_rows(result, other_ids={"d"}, labels=labels)
-    assert rows[0] == {"rank": 1, "name": "Taco Place", "categories": "Mexican", "price": "$$$",
+    assert rows[0] == {"rank": 1, "api_rank": 1, "name": "Taco Place", "categories": "Mexican", "price": "$$$",
                        "score": 0.912, "M1": 0.95, "M2": 0.871, "in_both": False}
     assert rows[1]["name"] == "QDOBA (2 locations)" and rows[1]["price"] == "–"
     assert rows[1]["in_both"]  # its second location is in the other list
@@ -469,3 +469,80 @@ def test_fit_view_contains_points_and_zooms_out_for_spread():
     assert page.TILE_PX == 512
     lon_px = (0.20 * 1.3) * page.TILE_PX * 2 ** vw["zoom"] / 360
     assert lon_px <= 1000 + 1
+
+
+def _api_result(names, members=("u1", "u2"), history=False):
+    """An API-shaped result whose member scores encode position: u1 = 1 - i/10, u2 = i/10."""
+    restaurants = [
+        {"business_id": f"id{i}", "name": n, "score": 0.0, "price_level": 1, "categories": "Food",
+         "lat": 39.9 + i / 100, "lon": -75.1, "member_scores": {"u1": 1 - i / 10, "u2": i / 10}}
+        for i, n in enumerate(names)
+    ]
+    result = {"strategy": "average", "members": list(members), "restaurants": restaurants,
+              "summary": {"note": "PREDICTED", "group_utility_predicted": -1.0,
+                          "worst_member_predicted": -1.0, "fairness_gap_predicted": -1.0}}
+    if history:
+        result["history"] = [{"dinner": i + 1, "business_id": f"id{i}", "member_scores": {"u1": 0.5, "u2": 0.5},
+                              "member_weights": {"u1": 0.5, "u2": 0.5}} for i in range(len(names))]
+    return result
+
+
+def test_trim_result_keeps_k_distinct_names_and_renumbers():
+    # API order: A, Chain, B, Chain, Chain, C, D  -> distinct: A, Chain(3), B, C, D
+    res = page.trim_result(_api_result(["A", "Chain", "B", "Chain", "Chain", "C", "D"]), k=4)
+    rows = res["restaurants"]
+    assert [r["display_name"] for r in rows] == ["A", "Chain (3 locations)", "B", "C"]
+    assert [r["rank"] for r in rows] == [1, 2, 3, 4]
+    assert [r["api_rank"] for r in rows] == [1, 2, 3, 6]
+    assert rows[1]["business_ids"] == ["id1", "id3", "id4"] and rows[1]["business_id"] == "id1"
+    assert res["api_k"] == 7
+    # summary recomputed over the kept rows (best locations id0, id1, id2, id5), as the API does
+    u1 = (1.0 + 0.9 + 0.8 + 0.5) / 4
+    u2 = (0.0 + 0.1 + 0.2 + 0.5) / 4
+    s = res["summary"]
+    assert s["group_utility_predicted"] == pytest.approx((u1 + u2) / 2)
+    assert s["worst_member_predicted"] == pytest.approx(min(u1, u2))
+    assert s["fairness_gap_predicted"] == pytest.approx(abs(u1 - u2))
+    assert s["note"] == "PREDICTED"
+    # display: collapse again is a no-op that keeps chain counts and new ranks
+    shown = page.display_rows(res, set(), page.member_labels(["u1", "u2"]))
+    assert [(r["rank"], r["api_rank"], r["name"]) for r in shown][:2] == [(1, 1, "A"), (2, 2, "Chain (3 locations)")]
+
+
+def test_trim_result_fairness_repeated_keeps_the_dinner_sequence():
+    raw = _api_result(["A", "Chain", "B", "Chain", "C", "D", "E"], history=True)
+    raw["strategy"] = "fairness_repeated"
+    res = page.trim_result(raw, k=5)
+    rows = res["restaurants"]
+    # first k dinners, in order, nothing collapsed or renumbered; repeat chain location labelled
+    assert [r["business_id"] for r in rows] == ["id0", "id1", "id2", "id3", "id4"]
+    assert [r["rank"] for r in rows] == [1, 2, 3, 4, 5]
+    assert [r["display_name"] for r in rows] == ["A", "Chain", "B", "Chain (another location)", "C"]
+    assert [h["dinner"] for h in res["history"]] == [1, 2, 3, 4, 5]
+    # summary over those k dinners
+    u1 = sum(1 - i / 10 for i in range(5)) / 5
+    u2 = sum(i / 10 for i in range(5)) / 5
+    assert res["summary"]["group_utility_predicted"] == pytest.approx((u1 + u2) / 2)
+    # display and per-dinner view keep the sequence and the label
+    labels = page.member_labels(["u1", "u2"])
+    shown = page.display_rows(res, set(), labels)
+    assert [r["name"] for r in shown] == ["A", "Chain", "B", "Chain (another location)", "C"]
+    assert [r["pick"] for r in page.dinner_rows(res, labels)][3] == "Chain (another location)"
+    assert [r["restaurant"] for r in page.top_member_rows(res, labels)][3] == "4. Chain (another location)"
+
+
+def test_trim_result_when_fewer_distinct_than_k():
+    res = page.trim_result(_api_result(["A", "A", "B"]), k=10)
+    assert [r["display_name"] for r in res["restaurants"]] == ["A (2 locations)", "B"]
+
+
+def test_overlap_counts_any_chain_location_in_trimmed_lists():
+    a = page.trim_result(_api_result(["A", "Chain", "B"]), k=3)["restaurants"]
+    b_raw = _api_result(["X", "Chain", "A"])
+    for r, bid in zip(b_raw["restaurants"], ["x", "id9", "id0"]):  # B kept a different Chain location
+        r["business_id"] = bid
+    b = page.trim_result(b_raw, k=3)["restaurants"]
+    a[1]["business_ids"].append("id9")  # A's Chain row also covers location id9
+    assert page.overlap_count(a, b) == 2  # A (id0) and Chain (via id9)
+    points = {p["name"]: p["list"] for p in page.map_points([{"restaurants": a}, {"restaurants": b}])}
+    assert points == {"A": "both", "Chain": "both", "B": "A", "X": "B"}
