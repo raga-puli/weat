@@ -14,7 +14,8 @@ con.execute("""
 COPY (
   SELECT business_id, name, latitude, longitude,
          stars, review_count, categories, attributes,
-         to_json(hours) AS hours
+         to_json(hours) AS hours,
+         CAST(is_open AS BOOLEAN) AS is_open  -- reported only; closed restaurants are kept
   FROM read_json_auto('data/raw/yelp_academic_dataset_business.json')
   WHERE lower(trim(city)) IN (
     'philadelphia',
@@ -32,13 +33,17 @@ COPY (
   )
     AND categories LIKE '%Restaurants%'
     AND review_count >= 20
+  -- Without ORDER BY, DuckDB's parallel scan writes rows in a different order
+  -- on every run; sorted, the order is stable and matches business_ids.txt.
+  ORDER BY business_id
 ) TO 'data/processed/restaurants.parquet'
 """)
 
-n_restaurants, n_with_hours = con.execute("""
-    SELECT count(*), count(hours) FROM 'data/processed/restaurants.parquet'
+n_restaurants, n_with_hours, n_open, n_closed = con.execute("""
+    SELECT count(*), count(hours), count(*) FILTER (is_open), count(*) FILTER (NOT is_open)
+    FROM 'data/processed/restaurants.parquet'
 """).fetchone()
-print(f"restaurants: {n_restaurants} rows, {n_with_hours} with hours")
+print(f"restaurants: {n_restaurants} rows, {n_with_hours} with hours, {n_open} open, {n_closed} closed")
 
 if args.stage == "restaurants":
     sys.exit(0)
