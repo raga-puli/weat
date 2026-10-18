@@ -200,3 +200,57 @@ def test_cli_prints_parsed_sql_and_results(conn, monkeypatch, capsys):
     assert '"max_price_level": 1' in out
     assert "price_level <= %s" in out
     assert "3 results:" in out
+
+
+# ---------- _as_dict (shared with src.db) ----------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ({"Friday": "11:0-22:0", "Monday": None}, {"Friday": "11:0-22:0"}),
+        ('{"Friday": "11:0-22:0", "Monday": null}', {"Friday": "11:0-22:0"}),
+        (None, None),
+        (float("nan"), None),
+        ("", None),
+        ("  ", None),
+        ("null", None),
+        ({"Monday": None}, None),
+    ],
+)
+def test_as_dict(value, expected):
+    from src.db import _as_dict
+
+    assert _as_dict(value, "biz1") == expected
+
+
+@pytest.mark.parametrize("value", ['{"Friday": "11:0-22:0"', "[1, 2]"])
+def test_as_dict_rejects_bad_json_naming_business(value):
+    from src.db import _as_dict
+
+    with pytest.raises(ValueError, match="business_id biz1"):
+        _as_dict(value, "biz1")
+
+
+def test_load_frame_parses_json_string_hours(monkeypatch):
+    restaurants = pd.DataFrame(
+        {
+            "business_id": ["x", "y"],
+            "name": ["X", "Y"],
+            "latitude": [39.95, 39.96],
+            "longitude": [-75.16, -75.17],
+            "stars": [4.0, 3.5],
+            "review_count": [30, 40],
+            "categories": ["Thai, Restaurants", None],
+            "attributes": [{"RestaurantsPriceRange2": "2"}, None],
+            "hours": ['{"Friday": "17:0-2:0"}', None],
+        }
+    )
+    emb = np.eye(2, 3, dtype=np.float32)
+    monkeypatch.setattr(s, "_frame", None)
+    monkeypatch.setattr(s.pd, "read_parquet", lambda path: restaurants)
+    monkeypatch.setattr(s.interfaces, "load_embeddings", lambda: (emb, ["y", "x"]))
+    frame, frame_emb = s.load_frame()
+    assert list(frame["hours"]) == [OPEN_LATE, None]
+    assert frame["price_level"].iat[0] == 2 and pd.isna(frame["price_level"].iat[1])
+    assert frame_emb.tolist() == [emb[1].tolist(), emb[0].tolist()]
