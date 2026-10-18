@@ -37,12 +37,12 @@ N_EMBEDDING_CHECKS = 20
 EMBEDDING_TOLERANCE = 1e-6
 
 
-def get_conn() -> psycopg.Connection:
+def get_conn(connect_timeout: int | None = None) -> psycopg.Connection:
     load_dotenv()
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set; copy .env.example to .env")
-    conn = psycopg.connect(url)
+    conn = psycopg.connect(url, **({} if connect_timeout is None else {"connect_timeout": connect_timeout}))
     register_vector(conn)
     return conn
 

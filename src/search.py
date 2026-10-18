@@ -18,9 +18,15 @@ Hard constraints filter; they never rank:
   with no hours are dropped. SQL over-fetches k * OPEN_AT_OVERFETCH rows and filters in Python, so
   fewer than k results can come back.
 
+- include_closed=False drops restaurants with is_open = false (NULL is kept). The default (True) is
+  for offline work; user-facing callers (the API) pass False.
+
 Ranking: by cosine similarity to the embedded soft text when soft is non-empty, otherwise by
 stars * ln(1 + review_count). Popularity ties break on business_id (byte order) so both versions
 agree; the similarity ORDER BY has no tie-break so pgvector indexes can be used.
+
+Both take an optional encoder (anything with SentenceTransformer's encode(text, normalize_embeddings=True));
+without one, the module-level model behind embed() is used.
 """
 
 import argparse
@@ -61,14 +67,24 @@ _model = None
 _frame = None
 
 
+def load_encoder():
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(MODEL_NAME)
+
+
 def embed(text: str) -> np.ndarray:
     """Encode text with the same model as the restaurant embeddings, loaded once per process."""
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-
-        _model = SentenceTransformer(MODEL_NAME)
+        _model = load_encoder()
     return _model.encode(text, normalize_embeddings=True).astype(np.float32)
+
+
+def _query_vec(text: str, encoder=None) -> np.ndarray:
+    if encoder is None:
+        return embed(text)
+    return np.asarray(encoder.encode(text, normalize_embeddings=True), dtype=np.float32)
 
 
 # ---------- shared pieces ----------
@@ -133,12 +149,17 @@ def _filter_open(rows: list[dict], open_at: str, k: int, hours_key: str = "hours
 # ---------- Postgres ----------
 
 
-def build_query(parsed: ParsedQuery, k: int, query_vec=None, include_null_price: bool = False):
+def build_query(
+    parsed: ParsedQuery, k: int, query_vec=None, include_null_price: bool = False, include_closed: bool = True
+):
     """Return (sql, params). query_vec must be given when parsed.soft is non-empty."""
-    select = ["business_id", "name", "price_level", "hours"]
+    select = ["business_id", "name", "categories", "latitude", "longitude", "price_level", "hours"]
     select_params: list = []
     where: list[str] = []
     where_params: list = []
+
+    if not include_closed:
+        where.append("is_open IS NOT FALSE")
 
     if parsed.max_price_level is not None:
         if include_null_price:
@@ -190,9 +211,11 @@ def build_query(parsed: ParsedQuery, k: int, query_vec=None, include_null_price:
     return sql, select_params + where_params + order_params + [limit]
 
 
-def search(conn, parsed: ParsedQuery, k: int = 10, include_null_price: bool = False) -> list[dict]:
-    query_vec = embed(parsed.soft) if parsed.soft else None
-    sql, params = build_query(parsed, k, query_vec, include_null_price)
+def search(
+    conn, parsed: ParsedQuery, k: int = 10, include_null_price: bool = False, include_closed: bool = True, encoder=None
+) -> list[dict]:
+    query_vec = _query_vec(parsed.soft, encoder) if parsed.soft else None
+    sql, params = build_query(parsed, k, query_vec, include_null_price, include_closed)
     with conn.cursor() as cur:
         cur.execute(sql, params)
         names = [d.name for d in cur.description]
@@ -206,6 +229,9 @@ def _result(row: dict) -> dict:
     return {
         "business_id": row["business_id"],
         "name": row["name"],
+        "categories": list(row["categories"] or []),
+        "latitude": None if row["latitude"] is None else float(row["latitude"]),
+        "longitude": None if row["longitude"] is None else float(row["longitude"]),
         "price_level": None if row["price_level"] is None or pd.isna(row["price_level"]) else int(row["price_level"]),
         "distance_km": None if row["distance_km"] is None else float(row["distance_km"]),
         "similarity": None if row["similarity"] is None else float(row["similarity"]),
@@ -238,6 +264,7 @@ def load_frame() -> tuple[pd.DataFrame, np.ndarray]:
                 "categories": restaurants["categories"].map(lambda c: parse_categories(c) or []),
                 "attributes": attributes,
                 "hours": [_as_dict(h, b) for h, b in zip(restaurants["hours"], bids)] if "hours" in restaurants else None,
+                "is_open": restaurants["is_open"].astype("boolean") if "is_open" in restaurants else pd.NA,
             }
         )
         _frame = (frame.reset_index(drop=True), emb[[row_of[b] for b in frame["business_id"]]])
@@ -267,6 +294,12 @@ def _prepare(frame: pd.DataFrame, emb: np.ndarray) -> dict:
             "price": frame["price_level"].astype("Float64").to_numpy(dtype=np.float64, na_value=np.nan),
             "lat": frame["latitude"].to_numpy(dtype=np.float64),
             "lon": frame["longitude"].to_numpy(dtype=np.float64),
+            # False only where is_open is false; NULL (or no column) counts as open, like IS NOT FALSE
+            "closed": (
+                frame["is_open"].astype("boolean").eq(False).fillna(False).to_numpy(dtype=bool)
+                if "is_open" in frame
+                else np.zeros(len(frame), dtype=bool)
+            ),
             "popularity": frame["stars"].to_numpy(dtype=np.float64) * np.log1p(frame["review_count"].to_numpy()),
             # exact (case-sensitive) category membership, like `%s = ANY(categories)`
             "cat_exact": np.array([_SEP + _SEP.join(c) + _SEP for c in cats]),
@@ -279,12 +312,20 @@ def _prepare(frame: pd.DataFrame, emb: np.ndarray) -> dict:
 
 
 def search_numpy(
-    parsed: ParsedQuery, k: int = 10, include_null_price: bool = False, data=None
+    parsed: ParsedQuery,
+    k: int = 10,
+    include_null_price: bool = False,
+    data=None,
+    include_closed: bool = True,
+    encoder=None,
 ) -> list[dict]:
     """Same filters and ranking as search(), on the parquet + .npy. data=(frame, emb) overrides the files."""
     frame, emb = data if data is not None else load_frame()
     arr = _prepare(frame, emb)
     mask = np.ones(len(frame), dtype=bool)
+
+    if not include_closed:
+        mask &= ~arr["closed"]
 
     if parsed.max_price_level is not None:
         price = arr["price"]
@@ -311,7 +352,7 @@ def search_numpy(
     ids = arr["ids"][idx]
     if parsed.soft:
         # scoring every row and then indexing avoids copying the embedding rows
-        similarity = (arr["emb64"] @ embed(parsed.soft).astype(np.float64))[idx]
+        similarity = (arr["emb64"] @ _query_vec(parsed.soft, encoder).astype(np.float64))[idx]
         order = np.lexsort((ids, -similarity))
     else:
         similarity = np.full(len(idx), np.nan)
@@ -325,6 +366,9 @@ def search_numpy(
             {
                 "business_id": ids[j],
                 "name": frame["name"].iat[i],
+                "categories": frame["categories"].iat[i],
+                "latitude": arr["lat"][i],
+                "longitude": arr["lon"][i],
                 "price_level": frame["price_level"].iat[i],
                 "hours": frame["hours"].iat[i] if "hours" in frame else None,
                 "distance_km": None if math.isnan(distance[i]) else float(distance[i]),

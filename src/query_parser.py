@@ -1,4 +1,5 @@
-"""Natural-language restaurant query -> ParsedQuery, via a local Ollama model.
+"""Natural-language restaurant query -> ParsedQuery, via a local Ollama model (parse) or keyword
+rules (parse_rules); parse_with_engine picks one and falls back from the LLM to the rules.
 
 Conventions the expected outputs in eval/queries.jsonl follow:
 - Budgets are per person: <$15 -> 1, <$30 -> 2, <$60 -> 3, else 4 (see price_level_for_budget).
@@ -18,15 +19,18 @@ Conventions the expected outputs in eval/queries.jsonl follow:
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import string
 import sys
 import types
 import typing
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 DIETARY = ("vegetarian", "vegan", "gluten_free", "halal", "kosher")
 
@@ -47,6 +51,11 @@ ANCHORS: dict[str, tuple[float, float]] = {
 OPEN_AT_RE = re.compile(r"^(now|(mon|tue|wed|thu|fri|sat|sun) ([01]\d|2[0-3]):[0-5]\d)$")
 
 PROMPT_VERSION = "v1"
+# parse_with_engine (the API path) gives the LLM one attempt of at most LLM_TIMEOUT_S, below the UI's
+# 30 s request timeout, then falls back to the rules. parse() / --eval have no timeout.
+LLM_TIMEOUT_S = 20.0
+# How long Ollama keeps the model in memory after a call; reloading a 7B model takes over a minute.
+LLM_KEEP_ALIVE = "30m"
 CACHE_DIR = Path("data/cache/llm")
 QUERIES_PATH = Path("eval/queries.jsonl")
 RESULTS_PATH = Path("results/parser.md")
@@ -225,12 +234,12 @@ def _model() -> str:
     return model
 
 
-def _client():
+def _client(timeout: float | None = None):
     import ollama
     from dotenv import load_dotenv
 
     load_dotenv()
-    return ollama.Client(host=os.getenv("OLLAMA_HOST"))
+    return ollama.Client(host=os.getenv("OLLAMA_HOST"), timeout=timeout)
 
 
 def _cache_path(model: str, text: str) -> Path:
@@ -244,23 +253,30 @@ def _chat(client, model: str, messages: list[dict]) -> str:
         messages=messages,
         format=json_schema(),
         options={"temperature": 0},
+        keep_alive=LLM_KEEP_ALIVE,
     )
     return response["message"]["content"]
 
 
 def parse(text: str, client=None, model: str | None = None) -> ParsedQuery:
     """Parse a query. Retries once on invalid output, then falls back to ParsedQuery(soft=text)."""
+    parsed = _parse_llm(text, client, model)
+    return parsed if parsed is not None else ParsedQuery(soft=text)
+
+
+def _parse_llm(text: str, client=None, model: str | None = None, attempts: int = 2) -> ParsedQuery | None:
+    """The LLM parse; None when every attempt is invalid. Connection/config/timeout errors propagate."""
     model = model or _model()
     path = _cache_path(model, text)
     if path.exists():
-        return validate(path.read_text(encoding="utf-8"))
+        return clean_soft(validate(path.read_text(encoding="utf-8")))
 
     client = client or _client()
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
-    for _ in range(2):
+    for _ in range(attempts):
         content = _chat(client, model, messages)
         try:
             parsed = validate(content)
@@ -272,9 +288,172 @@ def parse(text: str, client=None, model: str | None = None) -> ParsedQuery:
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(parsed)), encoding="utf-8")
-        return parsed
+        return clean_soft(parsed)
     # Fallbacks are not cached, so a later run can still succeed.
-    return ParsedQuery(soft=text)
+    return None
+
+
+# ---------- rules engine ----------
+
+ENGINES = ("rules", "llm")
+
+# Longest first, so "penn campus" wins over "penn".
+ANCHOR_ALIASES = {
+    "university of pennsylvania": "Penn campus",
+    "rittenhouse square": "Rittenhouse Square",
+    "italian market": "Italian Market",
+    "penn campus": "Penn campus",
+    "south philly": "Italian Market",
+    "rittenhouse": "Rittenhouse Square",
+    "city hall": "City Hall",
+    "old city": "Old City",
+    "fishtown": "Fishtown",
+    "drexel": "Drexel",
+    "temple": "Temple",
+    "upenn": "Penn campus",
+    "penn": "Penn campus",
+}
+CATEGORY_WORDS = (
+    "dim sum", "fried chicken", "hot pot", "korean bbq", "middle eastern",
+    "american", "bagels", "bakery", "bbq", "barbecue", "breakfast", "brunch", "burgers", "burritos",
+    "cafe", "cheesesteaks", "cheesesteak", "chinese", "coffee", "cuban", "dessert", "diner",
+    "dumplings", "ethiopian", "french", "greek", "indian", "italian", "japanese", "korean",
+    "lebanese", "mediterranean", "mexican", "noodles", "pho", "pizza", "ramen", "sandwiches",
+    "seafood", "steak", "steakhouse", "sushi", "tacos", "tapas", "thai", "turkish", "vietnamese",
+    "wings",
+)
+DIETARY_WORDS = {
+    "vegetarian": "vegetarian",
+    "vegan": "vegan",
+    "gluten free": "gluten_free",
+    "gluten-free": "gluten_free",
+    "halal": "halal",
+    "kosher": "kosher",
+}
+FILLER_WORDS = {"restaurant", "restaurants", "food", "eats", "somewhere"}
+_DAY = r"(mon|tue|wed|thu|fri|sat|sun)[a-z]*"
+_TIME = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+KM_PER_MILE = 1.609
+
+
+def _word_re(phrase: str) -> str:
+    return r"(?<![\w-])" + re.escape(phrase) + r"(?![\w-])"
+
+
+def parse_rules(text: str) -> ParsedQuery:
+    """Keyword/regex parse following the conventions in this module's docstring. No model, no I/O."""
+    rest = text.lower()
+
+    def take(pattern: str):
+        """Find pattern in what's left, blank it out, and return the match (or None)."""
+        nonlocal rest
+        m = re.search(pattern, rest)
+        if m:
+            rest = rest[: m.start()] + " " + rest[m.end():]
+        return m
+
+    price = None
+    if m := take(r"\b(?:under|less than|below)\s+\$\s?(\d+(?:\.\d+)?)(?:\s*(?:per|a)\s+(?:person|head))?"):
+        price = price_level_for_budget(float(m.group(1)) - 0.01)
+    elif m := take(r"\$\s?(\d+(?:\.\d+)?)\s*(?:per|a)\s+(?:person|head)"):
+        price = price_level_for_budget(float(m.group(1)))
+    elif m := take(r"(?<![\w$])(\${1,4})(?![\w$])"):
+        price = len(m.group(1))
+    elif take(r"\b(?:not too expensive|reasonably priced|affordable)\b"):
+        price = 2
+    elif take(r"\b(?:cheap|budget|inexpensive)\b"):
+        price = 1
+
+    distance = None
+    if m := take(r"\bwithin\s+(\d+(?:\.\d+)?)\s*(km|kilometers?|mi|miles?)\b(?:\s+(?:of|from))?"):
+        distance = float(m.group(1)) * (1 if m.group(2).startswith("k") else KM_PER_MILE)
+    elif take(r"\b(?:walkable|walking distance)\b(?:\s+(?:of|from|to))?"):
+        distance = WALKABLE_KM
+
+    near = None
+    for alias, anchor in ANCHOR_ALIASES.items():
+        if take(r"(?:\b(?:near|by|around|in|at|close to|from|of)\s+)?" + _word_re(alias)):
+            near = anchor
+            break
+
+    dietary: list[tuple[int, str]] = []
+    for word, tag in DIETARY_WORDS.items():
+        m = re.search(_word_re(word), rest)
+        if m and tag not in [d for _, d in dietary]:
+            dietary.append((m.start(), tag))
+            take(_word_re(word))
+
+    open_at = None
+    if take(r"\b(?:open\s+)?(?:right\s+)?now\b"):
+        open_at = "now"
+    elif m := take(r"\b(?:open\s+)?(?:on\s+)?" + _DAY + r"\b(?:\s+at)?\s+" + _TIME + r"(?!\w)"):
+        hour, minute, ampm = int(m.group(2)), int(m.group(3) or 0), m.group(4)
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+        if hour < 24 and minute < 60:
+            open_at = f"{m.group(1)} {hour:02d}:{minute:02d}"
+
+    categories: list[tuple[int, str]] = []
+    for word in CATEGORY_WORDS:
+        m = re.search(_word_re(word), rest)
+        if m:
+            categories.append((m.start(), word))
+            take(_word_re(word))
+
+    words = [w.strip(string.punctuation) for w in rest.split()]
+    words = [w for w in words if w and w not in FILLER_WORDS]
+    while words and words[0] in ("and", "or", "with"):
+        words.pop(0)
+    while words and words[-1] in ("and", "or", "with", "in", "near", "at", "from", "of"):
+        words.pop()
+
+    return ParsedQuery(
+        max_price_level=price,
+        near=near,
+        max_distance_km=distance,
+        dietary=[d for _, d in sorted(dietary)],
+        open_at=open_at,
+        categories=[c for _, c in sorted(categories)],
+        soft=" ".join(words),
+    )
+
+
+def preload_llm() -> None:
+    """Ask Ollama to load the model now (an empty prompt only loads it); failures are only logged."""
+    try:
+        _client().generate(model=_model(), prompt="", keep_alive=LLM_KEEP_ALIVE)
+    except Exception as err:
+        log.warning("LLM preload failed (%s: %s)", type(err).__name__, err)
+
+
+def clean_soft(parsed: ParsedQuery) -> ParsedQuery:
+    """Drop from the LLM's soft whatever the rules recognize as a captured field or filler.
+
+    The 7B model leaks captured phrases into soft ("near Temple", "under $15", "within 2 km") under
+    any prompt wording we tried; on eval/queries.jsonl this lifts soft accuracy 0.475 -> 0.800.
+    """
+    return replace(parsed, soft=parse_rules(parsed.soft).soft)
+
+
+def parse_with_engine(
+    text: str, engine: str = "llm", client=None, model: str | None = None
+) -> tuple[ParsedQuery, str]:
+    """(parsed, engine_used). "llm" makes one attempt (LLM_TIMEOUT_S when no client is given) and
+    falls back to the rules when Ollama is unreachable, misconfigured, too slow, or returns invalid
+    output, so engine_used can differ from engine."""
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {ENGINES}, got {engine!r}")
+    if engine == "llm":
+        try:
+            parsed = _parse_llm(text, client or _client(timeout=LLM_TIMEOUT_S), model, attempts=1)
+        except Exception as err:  # connection refused, timeout, model not pulled, LLM_MODEL unset, ...
+            log.warning("LLM parse failed (%s: %s); falling back to rules", type(err).__name__, err)
+            parsed = None
+        if parsed is not None:
+            return parsed, "llm"
+    return parse_rules(text), "rules"
 
 
 # ---------- eval ----------

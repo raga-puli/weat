@@ -280,3 +280,44 @@ def test_db_rows_load_is_open_and_json_hours(monkeypatch):
     assert [r["is_open"] for r in rows] == [True, False, None, None]
     assert rows[0]["hours"].obj == OPEN_LATE and rows[0]["price_level"] == 3
     assert [r["hours"] for r in rows[1:]] == [None, None, None]
+
+
+# ---------- encoder injection, include_closed ----------
+
+
+class _Encoder:
+    def __init__(self, vec):
+        self.vec, self.calls = vec, []
+
+    def encode(self, text, normalize_embeddings=True):
+        self.calls.append((text, normalize_embeddings))
+        return self.vec
+
+
+def test_injected_encoder_is_used_instead_of_the_module_model(monkeypatch):
+    monkeypatch.setattr(s, "embed", lambda text: pytest.fail("module model should not be used"))
+    encoder = _Encoder([0.0, 0.0, 1.0])
+    results = s.search_numpy(ParsedQuery(soft="steak"), data=DATA, k=1, encoder=encoder)
+    assert [r["business_id"] for r in results] == ["c"]
+    assert encoder.calls == [("steak", True)]
+
+
+def test_results_carry_categories_and_coordinates():
+    (top,) = s.search_numpy(ParsedQuery(categories=["thai"]), data=DATA)
+    assert top["categories"] == ["Thai", "Restaurants"]
+    assert top["latitude"] == pytest.approx(DATA[0]["latitude"].iat[0])
+    assert top["longitude"] == pytest.approx(DATA[0]["longitude"].iat[0])
+
+
+def test_include_closed_false_drops_only_is_open_false():
+    frame, emb = DATA
+    frame = frame.assign(is_open=pd.array([False, None, True, True, True, True], dtype="boolean"))
+    open_ids = [r["business_id"] for r in s.search_numpy(ParsedQuery(), data=(frame, emb), include_closed=False)]
+    all_ids = [r["business_id"] for r in s.search_numpy(ParsedQuery(), data=(frame, emb))]
+    assert set(all_ids) - set(open_ids) == {"a"}
+
+
+def test_build_query_include_closed():
+    sql, _ = s.build_query(ParsedQuery(), 10, include_closed=False)
+    assert "is_open IS NOT FALSE" in sql
+    assert "is_open" not in s.build_query(ParsedQuery(), 10)[0]
