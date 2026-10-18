@@ -181,3 +181,64 @@ def test_sample_users_by_cohesion(client):
 
 def test_sample_users_n_out_of_range(client):
     assert client.get("/group/users/sample", params={"n": 1}).status_code == 422
+
+
+# --- the API's model getter: taste cache vs. fresh fit -------------------------------
+
+from pathlib import Path  # noqa: E402
+
+from src import recommend  # noqa: E402
+from src.recommend import ContentBasedDebiased  # noqa: E402
+
+
+class FakeDebiased(ContentBasedDebiased):
+    def __init__(self):
+        self.matrix = FAKE_MODEL.matrix.astype(np.float32)
+        self.business_ids = list(IDS)
+        self.index = {b: i for i, b in enumerate(IDS)}
+        self.name = "fake_debiased"
+        self.embeddings_path = Path("fake.npy")
+        self.taste = {}
+        self.hub = np.zeros(len(IDS), dtype=np.float32)
+
+
+FAKE_TRAIN = pd.concat(
+    [df.assign(user_id=u) for u, df in FAKE_REVIEWS.items()], ignore_index=True
+)[["user_id", "business_id", "stars"]]
+
+
+def test_api_results_identical_from_cache_and_fresh_fit(monkeypatch, tmp_path):
+    monkeypatch.setattr(rg, "RECOMMENDER", FakeDebiased)
+    monkeypatch.setattr(rg, "_serving_train", lambda: FAKE_TRAIN)
+    monkeypatch.setattr(recommend, "cache_path", lambda name: tmp_path / f"taste_cache_{name}.npz")
+    monkeypatch.setattr(recommend, "cache_fingerprint", lambda model, user_filter=None: "fp-test")
+    fits = []
+    monkeypatch.setattr(FakeDebiased, "fit", lambda self, train: (fits.append(1), ContentBasedDebiased.fit(self, train))[1])
+
+    rg.get_recommender.cache_clear()
+    try:
+        fresh = rg.get_recommender()  # cold: fits and writes the cache
+        assert fits == [1] and (tmp_path / "taste_cache_fake_debiased.npz").exists()
+        rg.get_recommender.cache_clear()
+        cached = rg.get_recommender()  # warm: loads the cache, no fit
+        assert fits == [1] and cached is not fresh
+    finally:
+        rg.get_recommender.cache_clear()
+
+    bodies = []
+    for model in (fresh, cached):
+        app.dependency_overrides = {
+            rg.get_recommender: lambda m=model: m,
+            rg.get_restaurants: lambda: FAKE_RESTAURANTS,
+            rg.get_user_reviews: lambda: FAKE_REVIEWS,
+        }
+        try:
+            client = TestClient(app)
+            bodies.append([
+                client.post("/group/recommend", json={"members": ["u1", "u3"], "strategy": s, "k": 3}).json()
+                for s in ("average", "least_misery", "fairness_repeated")
+            ])
+        finally:
+            app.dependency_overrides = {}
+    assert bodies[0] == bodies[1]
+    assert all(b["restaurants"] for b in bodies[0])

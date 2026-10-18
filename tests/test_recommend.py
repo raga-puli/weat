@@ -247,3 +247,104 @@ def test_debiased_hub_restaurant_drops_in_rank(monkeypatch):
         assert after[u].index("hub") > before[u].index("hub")
     # it is the restaurant with the largest hub value
     assert ids[int(np.argmax(debiased.hub))] == "hub"
+
+
+# --- taste cache: save/load with an input fingerprint ---------------------------------
+
+import logging  # noqa: E402
+
+from src.recommend import cache_fingerprint, load_or_fit  # noqa: E402
+
+
+def test_taste_cache_round_trip(monkeypatch, tmp_path):
+    matrix, ids = _hub_world()
+    fitted, _ = _debiased_with(monkeypatch, matrix, ids)
+    fitted.fit(_likes([(f"u{i}", f"own{i}") for i in (2, 0, 3, 1)]))
+    path = tmp_path / "taste_cache_test.npz"
+    fitted.save_cache(path, "fp-1")
+    assert not path.with_name(path.name + ".tmp").exists()
+
+    restored, _ = _debiased_with(monkeypatch, matrix, ids)
+    assert restored.load_cache(path, "fp-1")
+    assert list(restored.taste) == list(fitted.taste)  # user order preserved
+    for u in fitted.taste:
+        np.testing.assert_array_equal(restored.taste[u], fitted.taste[u])
+        assert restored.taste[u].dtype == fitted.taste[u].dtype
+    np.testing.assert_array_equal(restored.hub, fitted.hub)
+    for u in fitted.taste:
+        np.testing.assert_array_equal(restored.scores_for(restored.taste[u]), fitted.scores_for(fitted.taste[u]))
+
+    # a model without a hub round-trips too
+    _, centered = _debiased_with(monkeypatch, matrix, ids)
+    centered.fit(_likes([("u0", "own0"), ("u1", "own1")]))
+    centered.save_cache(tmp_path / "c.npz", "fp-c")
+    _, centered2 = _debiased_with(monkeypatch, matrix, ids)
+    assert centered2.load_cache(tmp_path / "c.npz", "fp-c")
+    np.testing.assert_array_equal(np.stack(list(centered2.taste.values())), np.stack(list(centered.taste.values())))
+
+
+def test_taste_cache_rejects_stale_or_missing(monkeypatch, tmp_path):
+    matrix, ids = _hub_world()
+    fitted, _ = _debiased_with(monkeypatch, matrix, ids)
+    fitted.fit(_likes([("u0", "own0")]))
+    path = tmp_path / "cache.npz"
+    fitted.save_cache(path, "fp-old")
+
+    fresh, _ = _debiased_with(monkeypatch, matrix, ids)
+    assert not fresh.load_cache(path, "fp-new")
+    assert fresh.taste == {} and not fresh.hub.any()  # untouched on rejection
+    assert not fresh.load_cache(tmp_path / "missing.npz", "fp-old")
+
+    # a cache without a hub can't restore a debiased model
+    _, centered = _debiased_with(monkeypatch, matrix, ids)
+    centered.fit(_likes([("u0", "own0")]))
+    centered.save_cache(tmp_path / "nohub.npz", "fp")
+    assert not fresh.load_cache(tmp_path / "nohub.npz", "fp")
+
+
+def test_cache_fingerprint_tracks_inputs(monkeypatch, tmp_path):
+    files = {}
+    for name in ("TRAIN_REVIEWS", "BUSINESS_IDS", "USERS", "EMBEDDINGS"):
+        files[name] = tmp_path / name.lower()
+        files[name].write_text("x")
+        monkeypatch.setattr(interfaces, name, files[name])
+    matrix, ids = _hub_world()
+    model, _ = _debiased_with(monkeypatch, matrix, ids)
+    model.embeddings_path = files["EMBEDDINGS"]
+    base = cache_fingerprint(model)
+    assert cache_fingerprint(model) == base
+    assert cache_fingerprint(model, "another user filter") != base
+    model.name = "other_name"
+    assert cache_fingerprint(model) != base
+    model.name = "content_debiased"
+    for name, path in files.items():
+        path.write_text("xy")  # size (and mtime) change
+        assert cache_fingerprint(model) != base, name
+        path.write_text("x")
+        import os
+        os.utime(path, ns=(1, 1))  # same size, different mtime
+        assert cache_fingerprint(model) != base, name
+
+
+def test_load_or_fit_cold_then_warm(monkeypatch, tmp_path, caplog):
+    matrix, ids = _hub_world()
+    monkeypatch.setattr(recommend_module, "cache_fingerprint", lambda model, user_filter=None: "fp")
+    train = _likes([(f"u{i}", f"own{i}") for i in range(4)])
+    path = tmp_path / "cache.npz"
+
+    cold, _ = _debiased_with(monkeypatch, matrix, ids)
+    with caplog.at_level(logging.WARNING, logger="src.recommend"):
+        assert load_or_fit(cold, train_fn=lambda: train, path=path) is False
+    assert "cold path" in caplog.text and path.exists()
+
+    warm, _ = _debiased_with(monkeypatch, matrix, ids)
+    caplog.clear()
+
+    def no_fit():
+        raise AssertionError("warm path must not fit")
+
+    with caplog.at_level(logging.WARNING, logger="src.recommend"):
+        assert load_or_fit(warm, train_fn=no_fit, path=path) is True
+    assert caplog.text == ""
+    assert list(warm.taste) == list(cold.taste)
+    np.testing.assert_array_equal(warm.hub, cold.hub)

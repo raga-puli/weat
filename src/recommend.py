@@ -1,10 +1,17 @@
+import argparse
+import json
+import logging
+import os
 import random
+import time
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.stats import skew
 
+from src import interfaces
 from src.interfaces import (
     EMBEDDINGS,
     EMBEDDINGS_BLOB,
@@ -13,12 +20,15 @@ from src.interfaces import (
     load_embeddings,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class ContentBased:
     def __init__(self, embeddings_path=EMBEDDINGS, name="content_chunked"):
         self.matrix, self.business_ids = load_embeddings(embeddings_path)
         self.index = {business_id: i for i, business_id in enumerate(self.business_ids)}
         self.name = name
+        self.embeddings_path = Path(embeddings_path)
         self.taste = {}
 
     def fit(self, train: pd.DataFrame) -> None:
@@ -97,6 +107,47 @@ class ContentBased:
         """scores_for for a batch of users: (n_users, n_restaurants)."""
         return taste_matrix @ self.matrix.T
 
+    # --- fitted-state cache (see load_or_fit) ---------------------------------
+
+    def _cache_extra(self) -> dict:
+        """Extra fitted arrays to cache beyond the taste vectors."""
+        return {}
+
+    def _load_cache_extra(self, z) -> bool:
+        return True
+
+    def save_cache(self, path, fingerprint: str) -> None:
+        """Write user_ids (in fit order), the taste matrix and any extra fitted
+        state, with `fingerprint`, to `path` (.npz). Written to a temp file and
+        renamed, so a half-written cache is never read."""
+        users = list(self.taste)
+        taste = (np.stack([self.taste[u] for u in users]) if users
+                 else np.zeros((0, self.matrix.shape[1]), dtype=self.matrix.dtype))
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as f:
+            np.savez(f, user_ids=np.array(users, dtype=str), taste=taste,
+                     fingerprint=np.array(fingerprint), **self._cache_extra())
+        os.replace(tmp, path)
+
+    def load_cache(self, path, fingerprint: str) -> bool:
+        """Restore fitted state from `path` if it exists and its fingerprint
+        matches; otherwise leave the model untouched and return False."""
+        path = Path(path)
+        if not path.exists():
+            return False
+        with np.load(path, allow_pickle=False) as z:
+            if "fingerprint" not in z.files or str(z["fingerprint"]) != fingerprint:
+                return False
+            users = z["user_ids"].tolist()
+            taste = z["taste"]
+            extra_ok = self._load_cache_extra(z)
+        if not extra_ok or len(users) != len(taste):
+            return False
+        self.taste = {u: taste[i] for i, u in enumerate(users)}
+        return True
+
 
 class ContentBasedBlob(ContentBased):
     def __init__(self, embeddings_path=EMBEDDINGS_BLOB, name="content_blob"):
@@ -156,6 +207,59 @@ class ContentBasedDebiased(ContentBasedCentered):
         scores = self.scores_for(self.taste[user_id])
         return [float(scores[self.index[b]]) if b in self.index else float("nan") for b in business_ids]
 
+    def _cache_extra(self) -> dict:
+        return {"hub": self.hub}
+
+    def _load_cache_extra(self, z) -> bool:
+        if "hub" not in z.files or z["hub"].shape != self.hub.shape:
+            return False
+        self.hub = z["hub"]
+        return True
+
+
+MODELS = {cls.__name__: cls for cls in (ContentBased, ContentBasedBlob, ContentBasedCentered, ContentBasedDebiased)}
+SERVING_USER_FILTER = "users.parquet: users with 5+ reviews"
+
+
+def serving_train() -> pd.DataFrame:
+    """Train reviews of the users the API serves: users.parquet (5+ reviews),
+    which includes every val user. Train has ~205k users, most with one or two
+    reviews; fitting all of them takes many minutes."""
+    users = set(pd.read_parquet(interfaces.USERS, columns=["user_id"])["user_id"])
+    train = pd.read_parquet(interfaces.TRAIN_REVIEWS, columns=["user_id", "business_id", "stars"])
+    return train[train["user_id"].isin(users)]
+
+
+def cache_path(model_name: str) -> Path:
+    return interfaces.DATA / f"taste_cache_{model_name}.npz"
+
+
+def cache_fingerprint(model: ContentBased, user_filter: str = SERVING_USER_FILTER) -> str:
+    """What a cached fit depends on: size + mtime of the train reviews, the
+    model's embeddings, business_ids.txt and users.parquet (the user filter's
+    input), plus the model name and the user filter."""
+    files = {}
+    for label, path in (("train_reviews", interfaces.TRAIN_REVIEWS), ("embeddings", model.embeddings_path),
+                        ("business_ids", interfaces.BUSINESS_IDS), ("users", interfaces.USERS)):
+        st = Path(path).stat()
+        files[label] = [st.st_size, st.st_mtime_ns]
+    return json.dumps({"model": model.name, "user_filter": user_filter, "files": files}, sort_keys=True)
+
+
+def load_or_fit(model: ContentBased, train_fn=serving_train, user_filter: str = SERVING_USER_FILTER,
+                path=None) -> bool:
+    """Restore `model` from its taste cache if valid; otherwise fit it on
+    train_fn(), write the cache, and log a warning. Returns True on a cache hit.
+    The fitted state is identical either way."""
+    path = Path(path) if path is not None else cache_path(model.name)
+    fingerprint = cache_fingerprint(model, user_filter)
+    if model.load_cache(path, fingerprint):
+        return True
+    logger.warning("taste cache %s missing or stale; fitting %s from scratch (cold path)", path, model.name)
+    model.fit(train_fn())
+    model.save_cache(path, fingerprint)
+    return False
+
 
 def hubness_diagnostics(recs, catalog_business_ids, seed=SEED, n_pairs=500):
     """Diagnose how much a recs dict[user_id, list[business_id]]
@@ -207,3 +311,18 @@ def hubness_diagnostics(recs, catalog_business_ids, seed=SEED, n_pairs=500):
         "mean_top10_overlap": mean_top10_overlap,
         "n_pairs_sampled": len(overlaps),
     }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="python -m src.recommend build-cache --model NAME")
+    parser.add_argument("command", choices=["build-cache"])
+    parser.add_argument("--model", choices=sorted(MODELS), default="ContentBasedDebiased")
+    args = parser.parse_args()
+
+    model = MODELS[args.model]()
+    path = cache_path(model.name)
+    t0 = time.perf_counter()
+    model.fit(serving_train())
+    model.save_cache(path, cache_fingerprint(model))
+    print(f"fit {len(model.taste)} taste vectors ({SERVING_USER_FILTER}) in {time.perf_counter() - t0:.0f}s; "
+          f"wrote {path}")

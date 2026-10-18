@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 from src import interfaces
 from src.aggregate import LAMBDA, STRATEGIES as AGGREGATORS, fairness_repeated, normalize
 from src.groups import GROUPS
+from src import recommend as recommend_lib  # not `recommend`: that's the POST /recommend handler below
 from src.recommend import ContentBasedCentered, ContentBasedDebiased
 
 router = APIRouter(prefix="/group", tags=["group"])
@@ -43,18 +44,18 @@ RECOMMENDER = ContentBasedDebiased
 
 @lru_cache(maxsize=1)
 def _serving_train() -> pd.DataFrame:
-    """Train reviews of the users the API serves: users.parquet (5+ reviews),
-    which includes every val user. Train has ~205k users, most with one or
-    two reviews; fitting all of them takes minutes."""
-    users = set(pd.read_parquet(interfaces.USERS, columns=["user_id"])["user_id"])
-    train = pd.read_parquet(interfaces.TRAIN_REVIEWS, columns=["user_id", "business_id", "stars"])
-    return train[train["user_id"].isin(users)]
+    """recommend_lib.serving_train(), read once per process."""
+    return recommend_lib.serving_train()
 
 
 @lru_cache(maxsize=1)
 def get_recommender() -> ContentBasedCentered:
+    """The served model, restored from data/processed/taste_cache_<name>.npz
+    when the cache's fingerprint matches; otherwise fit (cold path: logged as a
+    warning) and the cache written. Identical state either way. Build the cache
+    ahead of time with `python -m src.recommend build-cache --model <class>`."""
     model = RECOMMENDER()
-    model.fit(_serving_train())
+    recommend_lib.load_or_fit(model, train_fn=_serving_train)
     return model
 
 
