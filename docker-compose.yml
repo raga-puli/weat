@@ -1,6 +1,23 @@
-# Postgres 16 + pgvector. Credentials come from .env (POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT);
+# Postgres 16 + pgvector, the search API, and the Streamlit UI.
+#
+#   docker compose up -d --build                      db + api + ui (LLM = your local Ollama)
+#   docker compose run --rm api python -m src.db load load restaurants + embeddings into db
+#   docker compose --profile llm up -d                also run Ollama in a container (see below)
+#
+# Credentials come from .env (POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_PORT);
 # the defaults below match DATABASE_URL in .env.example.
 # db/schema.sql only runs when the volume is first created; to re-run it: docker compose down -v
+#
+# .env's DATABASE_URL / OLLAMA_HOST / API_URL point at localhost, which inside a container is the
+# container itself, so the services below set their own values instead of reading those.
+# DOCKER_OLLAMA_HOST picks the LLM: default = the Ollama running on your machine; set it to
+# http://ollama:11434 (in .env or the shell) to use the `ollama` service from the "llm" profile.
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-rec}:${POSTGRES_PASSWORD:-rec}@db:5432/${POSTGRES_DB:-rec}
+  OLLAMA_HOST: ${DOCKER_OLLAMA_HOST:-http://host.docker.internal:11434}
+  LLM_MODEL: ${LLM_MODEL:-qwen2.5:7b-instruct}
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -19,5 +36,54 @@ services:
       timeout: 5s
       retries: 10
 
+  api:
+    build: .
+    image: weat-api:latest
+    environment:
+      <<: *app-env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+      - hf-cache:/cache/huggingface  # MiniLM is downloaded once, not on every container start
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Docker Desktop has this already; Linux needs it
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # no curl in python:slim; startup warms torch + MiniLM before /health answers
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 300s
+
+  ui:
+    build: .
+    image: weat-api:latest  # same image as api; this build is fully cached
+    command: streamlit run src/app.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      API_URL: http://api:8000
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Only for people without a local Ollama: docker compose --profile llm up -d, set
+  # DOCKER_OLLAMA_HOST=http://ollama:11434, then pull the model once:
+  #   docker compose exec ollama ollama pull qwen2.5:7b-instruct
+  # No host port is published, so it can't clash with a local Ollama on 11434.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm"]
+    volumes:
+      - ollama-models:/root/.ollama
+
 volumes:
   pgdata:
+  hf-cache:
+  ollama-models:

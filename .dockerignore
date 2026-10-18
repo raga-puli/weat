@@ -1,0 +1,20 @@
+# Keep the build context small and secret-free; the image only needs requirements.txt, src/, db/.
+data/
+.venv/
+venv/
+.git/
+.gitignore
+.env
+.claude/
+.vscode/
+.idea/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+*.npy
+*.parquet
+tests/
+results/
+results.md
+eval/
