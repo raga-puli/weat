@@ -242,3 +242,100 @@ def test_api_results_identical_from_cache_and_fresh_fit(monkeypatch, tmp_path):
             app.dependency_overrides = {}
     assert bodies[0] == bodies[1]
     assert all(b["restaurants"] for b in bodies[0])
+
+
+def test_user_profiles_endpoint(client):
+    body = client.get("/group/users/profiles", params=[("user_ids", "u2"), ("user_ids", "u1")]).json()
+    assert [u["user_id"] for u in body["users"]] == ["u2", "u1"]
+    assert [p["stars"] for p in body["users"][0]["profile"]] == [5.0, 5.0]
+    assert body["users"][1]["profile"][0]["name"] == "Restaurant 0"  # u1's 5-star b0 first
+    bad = client.get("/group/users/profiles", params=[("user_ids", "u1"), ("user_ids", "ghost")])
+    assert bad.status_code == 422 and "ghost" in bad.json()["detail"]
+    assert client.get("/group/users/profiles").status_code == 422
+
+
+# --- Group Dinner page helpers (pure functions; no Streamlit runtime) ---------------
+
+import importlib.util  # noqa: E402
+
+_spec = importlib.util.spec_from_file_location(
+    "group_dinner_page", Path(__file__).resolve().parents[1] / "src" / "pages" / "1_Group_Dinner.py"
+)
+page = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(page)  # __name__ != "__main__", so the UI doesn't run
+
+
+def _r(bid, name, score, scores, price=2, cats="Mexican, Restaurants"):
+    return {"business_id": bid, "name": name, "score": score, "member_scores": scores,
+            "price_level": price, "categories": cats}
+
+
+def test_collapse_chains_merges_same_name_keeping_best_rank():
+    rows = page.collapse_chains([
+        _r("a", "Taco Place", 0.9, {}), _r("b", "QDOBA", 0.8, {}), _r("c", "Pho", 0.7, {}),
+        _r("d", "QDOBA", 0.6, {}), _r("e", "QDOBA", 0.5, {}),
+    ])
+    assert [r["display_name"] for r in rows] == ["Taco Place", "QDOBA (3 locations)", "Pho"]
+    assert [r["rank"] for r in rows] == [1, 2, 3]  # original rank of the best location
+    assert rows[1]["business_ids"] == ["b", "d", "e"] and rows[1]["score"] == 0.8
+    assert page.collapse_chains([]) == []
+
+
+def test_display_rows_formatting_and_overlap():
+    result = {"restaurants": [
+        _r("a", "Taco Place", 0.91234, {"u1": 0.95, "u2": 0.871}, price=3),
+        _r("b", "QDOBA", 0.8, {"u1": 0.8, "u2": 0.8}, price=None),
+        _r("d", "QDOBA", 0.6, {"u1": 0.6, "u2": 0.6}),
+    ]}
+    labels = page.member_labels(["u1", "u2"])
+    assert labels == {"u1": "M1", "u2": "M2"}
+    rows = page.display_rows(result, other_ids={"d"}, labels=labels)
+    assert rows[0] == {"rank": 1, "name": "Taco Place", "categories": "Mexican", "price": "$$$",
+                       "score": 0.912, "M1": 0.95, "M2": 0.871, "in_both": False}
+    assert rows[1]["name"] == "QDOBA (2 locations)" and rows[1]["price"] == "–"
+    assert rows[1]["in_both"]  # its second location is in the other list
+
+
+def test_format_price():
+    assert [page.format_price(x) for x in (1, 2, 4, None, 0)] == ["$", "$$", "$$$$", "–", "–"]
+
+
+def test_parse_member_ids():
+    assert page.parse_member_ids("u1, u2\nu3") == (["u1", "u2", "u3"], None)
+    ids, err = page.parse_member_ids("u1")
+    assert ids == ["u1"] and "at least 2" in err
+    _, err = page.parse_member_ids(" ".join(f"u{i}" for i in range(7)))
+    assert "at most 6" in err
+    _, err = page.parse_member_ids("u1 u2 u1")
+    assert "repeated: u1" in err
+
+
+def test_dinner_rows():
+    result = {
+        "restaurants": [_r("a", "Taco Place", 0.9, {}), _r("b", "Pho", 0.8, {})],
+        "history": [
+            {"dinner": 1, "business_id": "a", "member_scores": {"u1": 0.9, "u2": 0.5},
+             "member_weights": {"u1": 0.5, "u2": 0.5}},
+            {"dinner": 2, "business_id": "b", "member_scores": {"u1": 0.4, "u2": 0.95},
+             "member_weights": {"u1": 0.01, "u2": 0.99}},
+        ],
+    }
+    rows = page.dinner_rows(result, page.member_labels(["u1", "u2"]))
+    assert rows[1] == {"dinner": 2, "pick": "Pho", "M1 score": 0.4, "M1 weight": 0.01,
+                       "M2 score": 0.95, "M2 weight": 0.99}
+
+
+def test_format_api_error():
+    ours = 'POST /group/compare failed with HTTP 422: {"detail":"unknown user_ids or users without a taste profile: [\'ghost\']"}'
+    assert page.format_api_error(ours) == "unknown user_ids or users without a taste profile: ['ghost']"
+    pydantic = ('POST /group/compare failed with HTTP 422: '
+                '{"detail":[{"loc":["body","members"],"msg":"List should have at least 2 items"}]}')
+    assert page.format_api_error(pydantic) == "members: List should have at least 2 items"
+    down = "Can't reach the API at http://localhost:8000. Is it running?"
+    assert page.format_api_error(down) == down
+
+
+def test_short_categories():
+    assert page.short_categories("Restaurants, Mexican, Food, Tacos") == "Mexican, Tacos"
+    assert page.short_categories("A, B, C, D, Restaurants") == "A, B, C, …"
+    assert page.short_categories(None) == "" and page.short_categories("") == ""
