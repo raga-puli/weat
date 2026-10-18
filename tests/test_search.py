@@ -254,3 +254,29 @@ def test_load_frame_parses_json_string_hours(monkeypatch):
     assert list(frame["hours"]) == [OPEN_LATE, None]
     assert frame["price_level"].iat[0] == 2 and pd.isna(frame["price_level"].iat[1])
     assert frame_emb.tolist() == [emb[1].tolist(), emb[0].tolist()]
+
+
+def test_db_rows_load_is_open_and_json_hours(monkeypatch):
+    from src import db
+
+    restaurants = pd.DataFrame(
+        {
+            "business_id": ["w", "x", "y", "z"],
+            "name": ["W", "X", "Y", "Z"],
+            "latitude": [39.95] * 4,
+            "longitude": [-75.16] * 4,
+            "stars": [4.0] * 4,
+            "review_count": [30] * 4,
+            "categories": ["Thai"] * 4,
+            "attributes": [{"RestaurantsPriceRange2": "3"}, None, None, None],
+            "hours": ['{"Friday": "17:0-2:0"}', None, "", None],
+            "is_open": pd.array([True, False, None, pd.NA], dtype="boolean"),
+        }
+    )
+    emb = np.eye(4, 3, dtype=np.float32)
+    monkeypatch.setattr(db.pd, "read_parquet", lambda path: restaurants)
+    monkeypatch.setattr(db.interfaces, "load_embeddings", lambda: (emb, ["w", "x", "y", "z"]))
+    rows = [dict(zip(db.COLUMNS, row)) for row in db._rows()]
+    assert [r["is_open"] for r in rows] == [True, False, None, None]
+    assert rows[0]["hours"].obj == OPEN_LATE and rows[0]["price_level"] == 3
+    assert [r["hours"] for r in rows[1:]] == [None, None, None]

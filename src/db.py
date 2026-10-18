@@ -30,6 +30,7 @@ COLUMNS = [
     "categories",
     "attributes",
     "hours",
+    "is_open",
     "embedding",
 ]
 N_EMBEDDING_CHECKS = 20
@@ -47,7 +48,7 @@ def get_conn() -> psycopg.Connection:
 
 
 def _missing(value) -> bool:
-    return value is None or (isinstance(value, float) and math.isnan(value))
+    return value is None or value is pd.NA or (isinstance(value, float) and math.isnan(value))
 
 
 def parse_price_level(value) -> int | None:
@@ -104,6 +105,8 @@ def _rows() -> list[tuple]:
 
     if "hours" not in restaurants.columns:
         print("warning: restaurants.parquet has no hours column; loading hours as NULL (re-run src/prep.py)")
+    if "is_open" not in restaurants.columns:
+        print("warning: restaurants.parquet has no is_open column; loading is_open as NULL (re-run src/prep.py)")
 
     rows = []
     for r in restaurants.to_dict("records"):
@@ -121,6 +124,7 @@ def _rows() -> list[tuple]:
                 parse_categories(r["categories"]),
                 None if attributes is None else Jsonb(attributes),
                 None if hours is None else Jsonb(hours),
+                None if _missing(r.get("is_open")) else bool(r["is_open"]),
                 emb[row_of[r["business_id"]]],
             )
         )
@@ -156,6 +160,11 @@ def check() -> None:
         print("\nprice_level distribution:")
         for level, count in cur.fetchall():
             print(f"  {level}: {count}")
+
+        cur.execute("SELECT is_open, count(*) FROM restaurants GROUP BY 1 ORDER BY 1 NULLS LAST")
+        print("\nis_open distribution:")
+        for is_open, count in cur.fetchall():
+            print(f"  {is_open}: {count}")
 
         emb, business_ids = interfaces.load_embeddings()
         row_of = {bid: i for i, bid in enumerate(business_ids)}
