@@ -223,3 +223,190 @@ def test_lifespan_is_registered_on_the_app(monkeypatch):
     with TestClient(app) as c:
         assert c.get("/health").status_code == 200
     assert warmed == [True]
+
+
+# ---------- manual overrides ("Edit filters") ----------
+
+
+def test_parsed_override_skips_the_parser(sql_on_numpy):
+    app.dependency_overrides[rs.get_parser] = lambda: lambda text, engine: pytest.fail("parser should not run")
+    response = sql_on_numpy.post(
+        "/search", json={"text": QUERY, "parsed": {"max_price_level": 4, "near": "Penn campus", "dietary": ["vegetarian"]}}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["engine_used"] == "manual"
+    assert body["parsed"]["max_price_level"] == 4 and body["parsed"]["soft"] == ""
+    assert ids(response) == ["cozy", "loud", "pricey"]  # price 4 lets "pricey" in; no soft -> popularity order
+
+
+@pytest.mark.parametrize(
+    "parsed",
+    [{"near": "Narnia"}, {"dietary": ["paleo"]}, {"open_at": "friday night"}, {"max_price_level": 7}, {"bogus": 1}],
+)
+def test_bad_parsed_override_is_422(sql_on_numpy, parsed):
+    assert sql_on_numpy.post("/search", json={"text": QUERY, "parsed": parsed}).status_code == 422
+
+
+# ---------- Search page (src/pages/2_Search.py), via Streamlit's AppTest ----------
+
+from pathlib import Path  # noqa: E402
+
+from streamlit.testing.v1 import AppTest  # noqa: E402
+
+from src import ui_common  # noqa: E402
+
+PAGE = str(Path(__file__).resolve().parents[1] / "src" / "pages" / "2_Search.py")
+ANCHOR_LIST = [{"name": n, "lat": lat, "lon": lon} for n, (lat, lon) in ANCHORS.items()]
+RESULT = {
+    "business_id": "cozy", "name": "Cozy Greens", "categories": ["Vegetarian", "Cafes"], "price_level": 1,
+    "lat": PENN[0], "lon": PENN[1], "distance_km": 0.2, "similarity": 0.9,
+}
+
+
+def response(engine_used="llm", results=(RESULT,), **parsed):
+    full = {"max_price_level": None, "near": None, "max_distance_km": None, "dietary": [],
+            "open_at": None, "categories": [], "soft": ""}
+    return {"parsed": {**full, **parsed}, "engine_used": engine_used, "results": list(results),
+            "timings_ms": {"parse": 12.0, "search": 34.0, "total": 46.0}}
+
+
+@pytest.fixture
+def page(monkeypatch):
+    """The page with ui_common faked; set fake.reply (dict or APIError) and read fake.posts."""
+
+    class Fake:
+        reply = response(max_price_level=1, near="Penn campus", dietary=["vegetarian"], soft="cozy")
+        posts: list = []
+
+    def post(path, json=None):
+        Fake.posts.append((path, json))
+        if isinstance(Fake.reply, Exception):
+            raise Fake.reply
+        return Fake.reply
+
+    Fake.posts = []
+    monkeypatch.setattr(ui_common, "post", post)
+    monkeypatch.setattr(ui_common, "get", lambda path, params=None: ANCHOR_LIST)
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.fake = Fake
+    return at.run()
+
+
+def badges(at):
+    """st.badge renders as markdown ':<color>-badge[:material/icon: label]'."""
+    return [m.value for m in at.markdown if "-badge[" in m.value]
+
+
+def text_box(at, label_start):
+    return next(w for w in at.text_input if w.label.startswith(label_start))
+
+
+def search(at, text):
+    at.text_input(key="query").input(text)
+    at.button[0].click()  # the form's Search button
+    return at.run()
+
+
+def test_page_shows_examples_and_no_results_yet(page):
+    assert not page.exception
+    labels = [b.label for b in page.button]
+    assert len([lbl for lbl in labels if lbl != "Search"]) == 4
+    assert page.fake.posts == []
+
+
+def test_example_click_searches_and_renders_chips_table_timings(page):
+    page.button[1].click().run()
+    assert not page.exception
+    (path, payload), = page.fake.posts
+    assert path == "/search"
+    assert payload == {"text": page.button[1].label, "engine": "rules", "backend": "sql", "k": 10,
+                       "include_closed": False}
+    text = " ".join(str(e.value) for e in page.markdown) + " ".join(str(e.value) for e in page.caption)
+    assert "parse 12 ms · search 34 ms · total 46 ms" in text
+    df = page.dataframe[0].value
+    assert list(df.columns) == ["Name", "Categories", "Price", "Distance (km)", "Similarity"]
+    assert df.iloc[0].tolist()[:3] == ["Cozy Greens", "Vegetarian, Cafes", "$"]
+
+
+def test_chips_split_filters_and_vibe(page):
+    page = search(page, "cheap vegetarian near Penn campus, somewhere cozy")
+    bodies = badges(page)
+    assert any(b.startswith(":blue-badge[") and "filter · price ≤ $]" in b for b in bodies)
+    assert any(b.startswith(":blue-badge[") and "filter · near Penn campus]" in b for b in bodies)
+    assert any(b.startswith(":blue-badge[") and "filter · vegetarian]" in b for b in bodies)
+    assert any(b.startswith(":violet-badge[") and "vibe match · cozy]" in b for b in bodies)
+    assert any("engine · llm]" in b for b in bodies)
+
+
+def test_fallback_to_rules_warns(page):
+    page.sidebar.radio(key="engine").set_value("llm").run()
+    page.fake.reply = response(engine_used="rules", soft="cozy")
+    page = search(page, "somewhere cozy")
+    assert page.fake.posts[-1][1]["engine"] == "llm"
+    assert any("rules** parser ran instead" in w.value for w in page.warning)
+
+
+def test_empty_results_message(page):
+    page.fake.reply = response(results=(), max_price_level=1)
+    page = search(page, "cheap")
+    assert [i.value for i in page.info] == ["No restaurants match all filters — try loosening price or distance."]
+    assert not page.dataframe
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (ui_common.APIError("POST /search failed with HTTP 503: {\"detail\": \"Database unavailable\"}"), "numpy"),
+        (ui_common.APIError("Can't reach the API at http://localhost:8000. Is it running? Start it with: "
+                            "uvicorn src.api.main:app"), "uvicorn src.api.main:app"),
+        (ui_common.APIError("The API at http://localhost:8000 didn't answer POST /search within 30s."), "rules"),
+    ],
+)
+def test_api_errors_are_friendly(page, error, expected):
+    page.fake.reply = error
+    page = search(page, "anything")
+    assert not page.exception
+    assert any(expected in e.value for e in [*page.error, *page.warning])
+    assert not page.dataframe
+
+
+def test_backend_and_k_come_from_the_sidebar(page):
+    page.sidebar.radio(key="backend").set_value("numpy")
+    page.sidebar.slider(key="k").set_value(25)
+    page = search(page, "pizza")
+    assert page.fake.posts[-1][1]["backend"] == "numpy" and page.fake.posts[-1][1]["k"] == 25
+
+
+def test_edit_filters_reruns_with_parsed_override(page):
+    page = search(page, "cheap vegetarian near Penn campus, somewhere cozy")
+    next(w for w in page.selectbox if w.label == "Max price").set_value("$$$")
+    text_box(page, "Categories").input("vegan, Thai")
+    page.fake.reply = response(engine_used="manual", max_price_level=3)
+    rerun = [b for b in page.button if b.label == "Rerun with these filters"][0]
+    rerun.click().run()
+    assert not page.exception
+    (_, payload) = page.fake.posts[-1]
+    assert payload["parsed"] == {
+        "max_price_level": 3, "near": "Penn campus", "max_distance_km": None, "dietary": ["vegetarian"],
+        "open_at": None, "categories": ["vegan", "thai"], "soft": "cozy",
+    }
+    assert any("engine · manual" in b for b in badges(page))
+
+
+def test_edit_filters_can_clear_price_and_place(page):
+    page = search(page, "cheap vegetarian near Penn campus, somewhere cozy")
+    next(w for w in page.selectbox if w.label == "Max price").set_value("Any")
+    next(w for w in page.selectbox if w.label == "Near").set_value("Anywhere")
+    [b for b in page.button if b.label == "Rerun with these filters"][0].click().run()
+    parsed = page.fake.posts[-1][1]["parsed"]
+    assert parsed["max_price_level"] is None and parsed["near"] is None
+
+
+def test_failed_manual_rerun_keeps_the_previous_results(page):
+    page = search(page, "cheap vegetarian near Penn campus, somewhere cozy")
+    text_box(page, "Open at").input("friday night")  # invalid; the API answers 422
+    page.fake.reply = ui_common.APIError("POST /search failed with HTTP 422: invalid parsed query: open_at must be ...")
+    [b for b in page.button if b.label == "Rerun with these filters"][0].click().run()
+    assert any("rejected" in w.value for w in page.warning)
+    assert page.dataframe  # still showing the last good results

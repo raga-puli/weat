@@ -5,7 +5,8 @@
     GET  /search/anchors  the named places `near` can refer to
 
 engine="llm" falls back to the rules parser when Ollama is down or its output is invalid; engine_used
-says which one actually ran. Closed restaurants are excluded unless include_closed=true.
+says which one actually ran. A request may carry `parsed` (a corrected ParsedQuery from the UI's
+"Edit filters"); parsing is then skipped and engine_used is "manual". Closed restaurants are excluded unless include_closed=true.
 
 Heavy resources come from lru_cache getters (get_db_conn, get_encoder, get_search_data) behind
 dependencies, so tests can swap them with app.dependency_overrides. The DB connection and the parquet
@@ -106,10 +107,23 @@ class ParseRequest(BaseModel):
     engine: Engine = "llm"
 
 
+class ParsedQueryIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_price_level: int | None = None
+    near: str | None = None
+    max_distance_km: float | None = None
+    dietary: list[str] = []
+    open_at: str | None = None
+    categories: list[str] = []
+    soft: str = ""
+
+
 class SearchRequest(ParseRequest):
     k: int = Field(10, ge=1, le=50)
     backend: Literal["sql", "numpy"] = "sql"
     include_closed: bool = False
+    parsed: ParsedQueryIn | None = None
 
 
 class ParsedQueryOut(BaseModel):
@@ -124,7 +138,7 @@ class ParsedQueryOut(BaseModel):
 
 class ParseResponse(BaseModel):
     parsed: ParsedQueryOut
-    engine_used: Engine
+    engine_used: Literal["rules", "llm", "manual"]
 
 
 class Restaurant(BaseModel):
@@ -171,7 +185,13 @@ def search_restaurants(
     data: Annotated[Callable, Depends(search_data_provider)],
 ) -> SearchResponse:
     start = time.perf_counter()
-    parsed, engine_used = parser(req.text, req.engine)
+    if req.parsed is not None:
+        try:
+            parsed, engine_used = ParsedQuery(**req.parsed.model_dump()), "manual"
+        except ValueError as err:  # ParsedQuery's own checks: unknown anchor, dietary tag, open_at format
+            raise HTTPException(status_code=422, detail=f"invalid parsed query: {err}") from err
+    else:
+        parsed, engine_used = parser(req.text, req.engine)
     parse_ms = _ms(start)
 
     search_start = time.perf_counter()
