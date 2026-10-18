@@ -1,6 +1,8 @@
 # weat
 
 <img src="assets/weat.jpg" width="70%">
+<img width="707" height="1280" alt="image" src="https://github.com/user-attachments/assets/19588a27-53f4-4398-82d5-15d4b8a01e70" />
+
 
 
 A restaurant recommendation system built on Yelp-style business, review, and embedding data.
