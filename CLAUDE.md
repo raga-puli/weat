@@ -28,6 +28,7 @@ Supersedes the week 2 table; week 3 = everything each person owned in week 2 plu
 - Only write results files through their owning script's --log flag.
 - LLM calls go through Ollama (OLLAMA_HOST, LLM_MODEL from .env). Parser calls use temperature 0 and a JSON-schema `format`. Pin the exact model tag in every results/parser.md row.
 - Scripts may take CLI flags (argparse); the current ones are listed under "CLI flags" below. Keep that list in sync when adding or changing a flag.
+- Closed restaurants (is_open = false) STAY in all offline evaluation (eval.py, group_eval.py, baselines, splits, embeddings), because held-out reviews are historical. User-facing paths (API endpoints, Streamlit pages) exclude them by default via an include_closed=false parameter.
 - Heavy resources (embeddings, models, DB connections) are loaded through functools.lru_cache getter functions used as FastAPI dependencies, so tests can override them; never load them at import time.
 - API tests use FastAPI TestClient with dependency_overrides and must not need Postgres, Ollama, or real data files.
 
@@ -57,7 +58,7 @@ Run everything from the repo root as `python -m src.<module>` (paths are relativ
 5. `src/eval.py` — individual-user evaluation of `--model MODULE:CLASS` (fit on train) on val, or test with `--i-mean-it`: recall@10, NDCG@10, MRR, coverage, diversity, Spearman, latency. `--log` appends a row to `results.md`.
 6. `src/groups.py` — synthetic co-rating groups -> `groups.parquet`: 3–4 val-split users who each liked (>= 4 stars) the same target restaurant within 30 days, each with >= 3 likes before the window; at most 20 groups per target, 10 per user, 12,000 total; split 70/30 val/test by a hash of the group id.
 7. `src/group_eval.py` — time-respecting group evaluation: member profiles from train likes strictly before each group's window (target excluded); candidates exclude anything a member reviewed before the window. Strategies: random, popularity, and `src/aggregate.py`'s average, least_misery, fairness, fairness_repeated. Cluster-bootstrap CIs over targets. Writes `group_eval_<split>*.csv` and `*_lists.parquet` to `data/processed/`; `--log` appends to `results/groups.md`; `--tau-sensitivity` writes `group_eval_val_tau_sensitivity.csv` instead.
-8. Postgres/pgvector — `db/schema.sql` (restaurants with `embedding vector(384)`); `src/db.py` loads restaurants.parquet + `embeddings.npy` into it and checks the load. `src/db_groups.py` + `db/groups.sql` (group scoring in SQL) are on branch `a/db-groups`, not yet on main.
+8. Postgres/pgvector — `db/schema.sql` (restaurants with `embedding vector(384)` and a nullable `is_open boolean`); `src/db.py` loads restaurants.parquet + `embeddings.npy` into it and checks the load.
 9. Search — `src/query_parser.py` turns a query into a `ParsedQuery` via Ollama (responses cached under `data/cache/llm/`; `--eval` scores `eval/queries.jsonl`, `--log` appends to `results/parser.md`); `src/search.py` filters and ranks restaurants for a `ParsedQuery` in Postgres (`search`) or numpy (`search_numpy`); `src/bench.py` benchmarks latency and pgvector indexes (`--log` appends to `results/latency.md`).
 10. API and UI (week 3) — `uvicorn src.api.main:app` (`src/api/main.py`, routers in `src/api/routes_group.py` and `src/api/routes_search.py`); `streamlit run src/app.py` (pages in `src/pages/`, API helpers in `src/ui_common.py`).
 
@@ -71,7 +72,6 @@ Run everything from the repo root as `python -m src.<module>` (paths are relativ
 | `src.eval` | `--model MODULE:CLASS` (required), `--split {val,test}`, `--k N` (default 10), `--log NOTE`, `--config TEXT`, `--sample N`, `--i-mean-it` |
 | `src.groups` | none |
 | `src.group_eval` | `--split {val,test}`, `--i-mean-it`, `--sample N`, `--normalization/--norm {raw,zscore,rank}` (default rank), `--strategy NAME` or `--all` (default), `--lam X` (default 0.5), `--log NOTE`, `--tau-sensitivity` |
-| `src.db_groups` (branch `a/db-groups`) | command `load-taste` or `check` |
 | `src.db` | command `load` or `check` |
 | `src.search` | `QUERY`, `--k N` (default 10), `--include-null-price` |
 | `src.query_parser` | `[TEXT]`, `--eval`, `--log NOTE` |
@@ -85,5 +85,8 @@ Run everything from the repo root as `python -m src.<module>` (paths are relativ
 
 ## Working conventions in this codebase
 
-- Scripts use inline SQL strings against DuckDB rather than pandas transformations — prefer extending queries in that style rather than pulling data into pandas early.
-- Scripts currently have print-based sanity checks after each major step (row counts, sample rows) rather than assertions or tests. Follow this pattern if extending `prep.py`/`embed.py`.
+- Tests: pytest, under `tests/` in `test_<module>.py` files. New code needs tests, and `python -m pytest tests` must pass before committing. Tests that need a loaded Postgres (and the real data files) skip themselves when it isn't available; all other tests run on synthetic data.
+- CLI flags are allowed (argparse) and are listed in the "CLI flags" table above.
+- Both DuckDB and pandas are used: `src/prep.py` builds the Parquet tables with inline DuckDB SQL over the raw JSON; the other modules read Parquet with pandas. Extend prep in the DuckDB style; elsewhere, pandas is fine.
+- Data paths, `SEED`, and `RELEVANT_MIN_STARS` are defined in `src/interfaces.py`; import them rather than redefining them (`src/prep.py`'s SQL still spells out its paths).
+- Scripts print sanity checks (row counts, sample rows) after each major step, in addition to tests.

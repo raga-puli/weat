@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS restaurants (
   categories text[],
   attributes jsonb,
   hours jsonb,
+  is_open boolean,             -- Yelp is_open at snapshot time; NULL until the loader fills it
   embedding vector(384) NOT NULL
 );
 
