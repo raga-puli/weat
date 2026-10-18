@@ -675,3 +675,18 @@ def test_tau_sensitivity_includes_secondary_metrics():
         assert row.value == pytest.approx(expected.loc[gids, "fairness_gap_per_item"].mean())
     # primary rows still come first and keep their metric labels
     assert list(table["metric"].iloc[:4]) == ["hit@10", "hit@10 - average", "hit@10", "hit@10 - average"]
+
+
+def test_model_option_defaults_to_centered():
+    from src.group_eval import DEFAULT_MODEL, MODELS
+
+    parser = build_parser()
+    assert parser.parse_args([]).model == DEFAULT_MODEL == "ContentBasedCentered"
+    assert parser.parse_args(["--model", "ContentBasedDebiased"]).model == "ContentBasedDebiased"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "Nope"])
+    assert set(MODELS) == {"ContentBasedCentered", "ContentBasedDebiased"}
+    # default configs are unchanged; a non-default model is named in the logged config
+    assert strategy_config("average", "rank", 0.5, None) == strategy_config("average", "rank", 0.5, None, DEFAULT_MODEL)
+    assert "model=" not in strategy_config("average", "rank", 0.5, None)
+    assert strategy_config("average", "rank", 0.5, None, "ContentBasedDebiased").startswith("model=ContentBasedDebiased")

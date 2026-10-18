@@ -78,6 +78,8 @@ hit@10 by the target's pre-window review count (terciles):
 | mid | 2336 | 0.0021 | 0.0060 | 0.0188 | 0.0141 | 0.0154 | 0.0150 |
 | high | 2336 | 0.0017 | 0.0732 | 0.0154 | 0.0124 | 0.0124 | 0.0171 |
 
+Calibration: Spearman correlation between predicted scores and held-out star ratings is ~0.01 on val. Predicted scores rank restaurants by similarity to a user's history but barely predict how many stars they'll give, partly because held-out ratings are concentrated at 4–5 stars. All 'predicted satisfaction' figures should be read in that light.
+
 ### τ sensitivity (val, all values reported)
 
 fairness_repeated with each τ tested; differences vs. average with cluster-bootstrap 95% CIs (n = 7,008 overall, 3,504 per cohesion bucket). Worst member and group score use the primary (member-mean) definitions; the "per restaurant" columns are the secondary per-dinner definitions (see "Per-dinner vs. cumulative fairness"). Source: `python -m src.group_eval --tau-sensitivity` (`data/processed/group_eval_val_tau_sensitivity.csv`).
@@ -110,13 +112,35 @@ The two definitions measure different things. Per-restaurant metrics ask whether
 
 In low-cohesion groups, aggregation surfaces compromise restaurants that bridge members' tastes (e.g. a sample group of ramen, café, Chinese and vegan diners received mostly Mexican/Latin places that each member ranked in their top ~20%). This is aggregation working as intended, not an individual-model artifact.
 
+### Hubness correction
+
+`ContentBasedDebiased` subtracts each restaurant's mean similarity across all users from every score (column-centering the user-by-restaurant score matrix); it has no parameters and was fixed in advance.
+
+Individual-user val (25,439 users; `python -m src.eval`, not logged to `results.md`):
+
+| model | recall@10 | NDCG@10 | coverage | Spearman | k-occurrence skewness | top item (share of users) |
+| --- | --- | --- | --- | --- | --- | --- |
+| ContentBasedCentered | 0.0126 | 0.0065 | 0.989 | 0.011 | 4.42 | Talk 5.0% |
+| ContentBasedDebiased | 0.0121 | 0.0064 | 0.992 | 0.013 | 3.50 | Urban Saloon 3.6% |
+
+Group val (7,008 groups; `python -m src.group_eval --model ContentBasedDebiased`). hit@10, with the paired difference and its cluster-bootstrap 95% CI over targets, and concentration across the 7,008 top-10 lists:
+
+| strategy | hit@10 Centered | hit@10 Debiased | Debiased − Centered [95% CI] | unique restaurants (C → D) | skewness (C → D) | top hub share (C → D) |
+| --- | --- | --- | --- | --- | --- | --- |
+| average | 0.0191 | 0.0171 | −0.0020 [−0.0042, +0.0001] | 3,208 → 3,639 | 7.18 → 5.12 | Root 12.2% → Root 7.5% |
+| least_misery | 0.0160 | 0.0140 | −0.0020 [−0.0039, −0.0001] | 3,413 → 3,728 | 5.47 → 3.93 | Root 8.9% → Root 5.2% |
+| fairness | 0.0163 | 0.0153 | −0.0010 [−0.0028, +0.0008] | 3,381 → 3,722 | 5.79 → 4.11 | Root 9.4% → Root 5.5% |
+| fairness_repeated (τ=0.1) | 0.0170 | 0.0163 | −0.0007 [−0.0029, +0.0016] | 3,254 → 3,583 | 7.25 → 5.41 | Root 12.6% → Root 8.0% |
+
+The headline results above and the pre-registration use `ContentBasedCentered`. The API (`/group`) serves `ContentBasedDebiased`, because it cuts list concentration by about 30% (k-occurrence skewness −25% to −29% in group lists, −21% in individual lists) at an accuracy cost within or near noise: only least_misery's hit@10 drop has a CI that excludes zero, and only barely. Hubs are reduced, not eliminated: Root, Talk and Jamonera still lead the group lists, and some bars rise in the individual lists. The debiased group run's hub vector is fit on all train users, a single global statistic rather than a per-group pre-window one; the API's is fit on the users it serves (5+ reviews).
+
 ### Pre-registered for test
 
 Pre-registered 2026-10-17, before any test-split evaluation: fairness_repeated with τ=0.3 yields a higher worst-member predicted percentile than least_misery in low-cohesion groups, at a smaller group-score cost. τ=0.1 remains the original pre-registered default and will be reported regardless of outcome.
 
 ### Validation configurations tried
 
-Every group-evaluation configuration run on val, with how it can be verified. All used `ContentBasedCentered` with the chunked embeddings and rank-percentile normalization; no group evaluation has been run on test.
+Every group-evaluation configuration run on val, with how it can be verified. All used the chunked embeddings and rank-percentile normalization; runs 1–6 used `ContentBasedCentered`, run 7 `ContentBasedDebiased`. No group evaluation has been run on test.
 
 1. Groups v1 (`groups.py` as in commit "Add synthetic dinner groups": no prior-history filter at construction, cap 3,000 groups, no per-user cap), `--sample 500`, strategies random / popularity / average / least_misery / fairness. Verified: `data/processed/group_eval_val_sample500.csv` (119 surviving groups).
 2. Groups v1, full val, same five strategies. Not verifiable: its output file was overwritten by later runs.
@@ -124,13 +148,15 @@ Every group-evaluation configuration run on val, with how it can be verified. Al
 4. Groups v3 (current: v2 plus at most 10 groups per user), full val, same five strategies, cluster bootstrap. Not verifiable from `data/processed/` (overwritten by run 5); run 5 reproduced its five strategies' top-10 lists exactly when the aggregation interface changed.
 5. Groups v3, full val, the five strategies plus fairness_repeated with τ=0.1. Verified: `data/processed/group_eval_val.csv` and `group_eval_val_lists.parquet` (the tables above).
 6. Groups v3, τ sensitivity: fairness_repeated with τ ∈ {0.1, 0.3, 1.0, 3.0}. Verified: `data/processed/group_eval_val_tau_sensitivity.csv`. The same run also evaluated τ=1e6 as a sanity check against average (code path in `src/group_eval.py`; not in the CSV).
+7. Groups v3, full val, all six strategies with `--model ContentBasedDebiased`. Verified: `data/processed/group_eval_val_content_debiased.csv` and `group_eval_val_content_debiased_lists.parquet`, and the six "debiased model, val" rows in `results/groups.md`.
 
-The `--normalization raw` and `zscore` options exist in `src/group_eval.py`, but no val output for them exists and they have not been run. Individual-user (non-group) val runs are logged separately in `results.md` (random, popularity, content_chunked, content_blob).
+The `--normalization raw` and `zscore` options exist in `src/group_eval.py`, but no val output for them exists and they have not been run. Individual-user (non-group) val runs are logged separately in `results.md` (random, popularity, content_chunked, content_blob). `ContentBasedCentered` and `ContentBasedDebiased` were also evaluated individually on full val (the "Hubness correction" table) but not logged, since `results.md` is B's; those numbers come from the run output only and are reproducible with `python -m src.eval --model src.recommend:ContentBasedCentered` / `:ContentBasedDebiased`.
 
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.
-- Closed restaurants: 1,449 of the 3,902 restaurants are marked closed (`is_open`) in the dataset snapshot. They stay in all offline evaluation on purpose, because the held-out reviews are historical, so they appear in every evaluation candidate set. User-facing paths are to exclude them by default; that isn't built yet, and the Postgres loader doesn't load `is_open` yet.
+- Closed restaurants: 1,449 of the 3,902 restaurants are marked closed (`is_open`) in the dataset snapshot. They stay in all offline evaluation on purpose, because the held-out reviews are historical, so they appear in every evaluation candidate set. User-facing paths exclude them by default: the `/group` API does (`include_closed=false`); the Postgres loader doesn't load `is_open` yet.
 - Groups are co-rating groups: strangers who liked the same place within 30 days, not real dining parties. Targets skew toward popular restaurants, and the same targets appear in both val and test groups.
 - Possible small target-embedding leak: in 1,672 of the 7,008 val groups, a member's own review of the target is among the reviews encoded into the target's embedding. Within the low and mid target-popularity terciles, flagged and unflagged groups showed no significant hit@10 difference for any content strategy, but an effect of about 0.005 is not ruled out.
 - Groups share targets (handled by the cluster bootstrap) and members (up to 10 groups per user, not clustered), so the CIs are slightly optimistic.
+- Morea, the only restaurant tagged "Adult" (its categories mix Nightlife, Adult, Bars, Seafood, Sandwiches, Shopping, Breakfast & Brunch and more), was the top hub in the API's lists under `ContentBasedCentered`: it appeared in 21% of 300 sampled API group lists and 15% of individual top-10s (closed restaurants excluded). In the group_eval lists, which include closed restaurants, it ranked third (8.9% of average lists) behind Root and Talk. Under `ContentBasedDebiased` it drops out of the top five hubs in the group lists.
