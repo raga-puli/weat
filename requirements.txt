@@ -11,3 +11,8 @@ pgvector
 python-dotenv
 tqdm
 ollama
+fastapi
+uvicorn[standard]
+requests
+httpx
+implicit
