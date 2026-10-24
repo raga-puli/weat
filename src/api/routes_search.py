@@ -14,7 +14,7 @@ dependencies, so tests can swap them with app.dependency_overrides. The DB conne
 frame are handed out as zero-argument providers so backend=numpy never connects to Postgres and
 backend=sql never reads the parquet; backend=numpy without the data files is a 400. At server start (the router's lifespan, merged into the app by
 include_router) a background thread warms the encoder and DB connection and Ollama starts loading its
-model, so the first search doesn't pay ~50 s of torch import. Startup doesn't wait for it: /health and
+model, so the first search doesn't pay the encoder load (~40 s with torch, ~1 s with ENCODER=onnx). Startup doesn't wait for it: /health and
 /search/parse answer at once, and /search returns 503 (Retry-After) until the encoder is loaded.
 TestClient without `with` skips the warm-up; /search then loads the encoder on first use.
 """
@@ -69,10 +69,8 @@ async def _lifespan(app):
 router = APIRouter(prefix="/search", tags=["search"], lifespan=_lifespan)
 
 DB_CONNECT_TIMEOUT_S = 5
-ENCODER_RETRY_AFTER_S = 10
-# The number is repeated in the text because ui_common.py (frozen) drops response headers; the Search
-# page reads it from there until ui_common gets shared 503 handling.
-ENCODER_WARMING = f"Search is starting up (loading the text encoder). Retry in {ENCODER_RETRY_AFTER_S} s."
+ENCODER_RETRY_AFTER_S = 10  # sent as Retry-After; src/ui_common.py waits this long and retries
+ENCODER_WARMING = "Search is starting up (loading the text encoder). Retry in a few seconds."
 DB_UNAVAILABLE = "Database unavailable. Start Postgres with `docker compose up -d`, or retry with backend=numpy."
 NUMPY_DATA_MISSING = (
     "backend=numpy needs the local data files, and {path} is missing. Build them with the pipeline "

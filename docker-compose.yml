@@ -45,19 +45,18 @@ services:
       - "${API_PORT:-8000}:8000"
     volumes:
       - ./data/processed:/app/data/processed:ro
-      - hf-cache:/cache/huggingface  # MiniLM is downloaded once, not on every container start
     extra_hosts:
       - "host.docker.internal:host-gateway"  # Docker Desktop has this already; Linux needs it
     depends_on:
       db:
         condition: service_healthy
     healthcheck:
-      # no curl in python:slim; startup warms torch + MiniLM before /health answers
+      # no curl in python:slim; /health answers at once (the encoder warms in the background)
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
       interval: 5s
       timeout: 5s
       retries: 6
-      start_period: 300s
+      start_period: 60s
 
   ui:
     build: .
@@ -85,5 +84,4 @@ services:
 
 volumes:
   pgdata:
-  hf-cache:
   ollama-models:

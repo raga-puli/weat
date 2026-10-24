@@ -20,3 +20,6 @@ venv/
 
 # Claude Code local settings
 .claude/
+
+# ONNX encoder files (python -m src.search --download-onnx)
+models/

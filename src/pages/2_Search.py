@@ -5,9 +5,7 @@ imported here. The parse is shown as chips; "Edit filters" sends a corrected par
 `parsed`, which the API runs without re-parsing (engine_used = "manual").
 """
 
-import re
 import sys
-import time
 from pathlib import Path
 
 import pandas as pd
@@ -45,34 +43,6 @@ state.setdefault("runs", 0)  # bumps on every search, so the "Edit filters" widg
 
 # ---------- API ----------
 
-# STOPGAP until ui_common.py gets shared wake/503 handling in the next scaffolding PR: while the API's
-# encoder warms up, /search returns 503 with Retry-After. ui_common.APIError keeps only the message,
-# so the delay is read from the API's message text ("Retry in N s"), which repeats Retry-After.
-WARMING_RE = re.compile(r"HTTP 503: .*starting up.*Retry in (\d+) s")
-MAX_WARMING_RETRIES = 6
-WARMING_MESSAGE = "Search is starting up, retrying..."
-
-
-def warming_retry_after(err: Exception) -> int | None:
-    """Seconds to wait if err is the API's warm-up 503, else None."""
-    match = WARMING_RE.search(str(err))
-    return int(match.group(1)) if match else None
-
-
-def post_with_warmup_retry(path, payload, *, post, sleep, on_retry=lambda attempt, delay: None,
-                           max_retries=MAX_WARMING_RETRIES):
-    """post(path, json=payload), retried up to max_retries times while the API is warming up, waiting
-    each time as long as it asks. Any other error, or the last warm-up 503, is raised."""
-    for attempt in range(max_retries + 1):
-        try:
-            return post(path, json=payload)
-        except ui_common.APIError as err:
-            delay = warming_retry_after(err)
-            if delay is None or attempt == max_retries:
-                raise
-            on_retry(attempt + 1, delay)
-            sleep(delay)
-
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_anchors() -> dict[str, tuple[float, float]]:
@@ -80,16 +50,16 @@ def load_anchors() -> dict[str, tuple[float, float]]:
 
 
 def classify_error(err: ui_common.APIError) -> tuple[str, str]:
-    """APIError carries only a message (ui_common is frozen), so the status is read from its text."""
+    """ui_common already waited out a sleeping host and retried warm-up 503s; this is what's left."""
     text = str(err)
-    if warming_retry_after(err) is not None:
+    if err.status == 503 and err.retry_after is not None:
         return "warming", "Search is still starting up. Try again in a minute."
-    if "HTTP 503" in text:
+    if err.status == 503:
         return "db_down", (
             "The search database is unavailable. Switch the backend to **numpy** in the sidebar, "
             "or start Postgres with `docker compose up -d`."
         )
-    if "HTTP 422" in text:
+    if err.status == 422:
         return "invalid", f"The search request was rejected: {text.split(':', 1)[-1].strip()}"
     if "Can't reach the API" in text:
         return "api_down", f"{text}"
@@ -111,21 +81,15 @@ def run_search(text: str, parsed: dict | None = None) -> None:
     if parsed is not None:
         payload["parsed"] = parsed
     state.requested_engine = "manual" if parsed is not None else state.engine
-    notice = st.empty()
     try:
         with st.spinner("Searching…"):
-            state.result = post_with_warmup_retry(
-                "/search", payload, post=ui_common.post, sleep=time.sleep,
-                on_retry=lambda attempt, delay: notice.info(WARMING_MESSAGE, icon=":material/hourglass_top:"),
-            )
+            state.result = ui_common.post("/search", json=payload)
         state.error = None
     except ui_common.APIError as err:
         state.error = classify_error(err)
-        notice.empty()
         if parsed is None:  # a failed manual rerun keeps the last results (and the filters being edited)
             state.result = None
         return
-    notice.empty()
     state.runs += 1
 
 

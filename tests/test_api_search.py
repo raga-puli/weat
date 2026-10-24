@@ -433,7 +433,8 @@ def test_empty_results_message(page):
 @pytest.mark.parametrize(
     "error, expected",
     [
-        (ui_common.APIError("POST /search failed with HTTP 503: {\"detail\": \"Database unavailable\"}"), "numpy"),
+        (ui_common.APIError("POST /search failed with HTTP 503: {\"detail\": \"Database unavailable\"}", status=503),
+         "numpy"),
         (ui_common.APIError("Can't reach the API at http://localhost:8000. Is it running? Start it with: "
                             "uvicorn src.api.main:app"), "uvicorn src.api.main:app"),
         (ui_common.APIError("The API at http://localhost:8000 didn't answer POST /search within 30s."), "rules"),
@@ -482,113 +483,18 @@ def test_edit_filters_can_clear_price_and_place(page):
 def test_failed_manual_rerun_keeps_the_previous_results(page):
     page = search(page, "cheap vegetarian near Penn campus, somewhere cozy")
     text_box(page, "Open at").input("friday night")  # invalid; the API answers 422
-    page.fake.reply = ui_common.APIError("POST /search failed with HTTP 422: invalid parsed query: open_at must be ...")
+    page.fake.reply = ui_common.APIError("POST /search failed with HTTP 422: invalid parsed query: open_at must be ...",
+                                         status=422)
     [b for b in page.button if b.label == "Rerun with these filters"][0].click().run()
     assert any("rejected" in w.value for w in page.warning)
     assert page.dataframe  # still showing the last good results
 
 
-# ---------- warm-up 503 retry (page stopgap) ----------
+# ---------- warm-up 503 left over after ui_common's retries ----------
 
 
-def _search_page_helpers() -> dict:
-    """The page's retry helpers, without running the page: its module-level code is Streamlit UI,
-    so only the names below are compiled, from the page's own source."""
-    import ast
-    import re
-    import time
-
-    names = {"WARMING_RE", "MAX_WARMING_RETRIES", "WARMING_MESSAGE", "warming_retry_after",
-             "post_with_warmup_retry"}
-    tree = ast.parse(Path(PAGE).read_text(encoding="utf-8"))
-    keep = [n for n in tree.body
-            if (isinstance(n, ast.FunctionDef) and n.name in names)
-            or (isinstance(n, ast.Assign) and {getattr(t, "id", None) for t in n.targets} & names)]
-    namespace = {"re": re, "time": time, "ui_common": ui_common}
-    exec(compile(ast.Module(body=keep, type_ignores=[]), PAGE, "exec"), namespace)
-    return namespace
-
-
-def warming_error(seconds=rs.ENCODER_RETRY_AFTER_S):
-    """What ui_common raises for the API's warm-up 503 (it keeps only the message)."""
-    detail = rs.ENCODER_WARMING.replace(f"{rs.ENCODER_RETRY_AFTER_S} s", f"{seconds} s")
-    return ui_common.APIError(f'POST /search failed with HTTP 503: {{"detail":"{detail}"}}')
-
-
-def test_warming_message_matches_the_api(client):
-    app.dependency_overrides.pop(rs.get_encoder)
-    rs._encoder_warming.set()
-    try:
-        response = client.post("/search", json={"text": QUERY, "backend": "numpy"})
-    finally:
-        rs._encoder_warming.clear()
-    err = ui_common.APIError(f"POST /search failed with HTTP {response.status_code}: {response.text[:300]}")
-    assert _search_page_helpers()["warming_retry_after"](err) == int(response.headers["retry-after"])
-
-
-def test_retry_helper_honors_retry_after_and_stops_after_six():
-    helpers = _search_page_helpers()
-    post_with_warmup_retry = helpers["post_with_warmup_retry"]
-
-    sleeps, retries = [], []
-    replies = [warming_error(10), warming_error(3), {"ok": True}]
-
-    def post(path, json=None):
-        reply = replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-    result = post_with_warmup_retry("/search", {"text": "x"}, post=post, sleep=sleeps.append,
-                                    on_retry=lambda attempt, delay: retries.append((attempt, delay)))
-    assert result == {"ok": True} and sleeps == [10, 3] and retries == [(1, 10), (2, 3)]
-
-    sleeps.clear()
-    calls = []
-
-    def always_warming(path, json=None):
-        calls.append(path)
-        raise warming_error(10)
-
-    with pytest.raises(ui_common.APIError, match="starting up"):
-        post_with_warmup_retry("/search", {}, post=always_warming, sleep=sleeps.append)
-    assert helpers["MAX_WARMING_RETRIES"] == 6 and len(calls) == 7 and sleeps == [10] * 6
-
-
-@pytest.mark.parametrize("error", [
-    ui_common.APIError('POST /search failed with HTTP 503: {"detail":"Database unavailable."}'),  # no retry hint
-    ui_common.APIError("POST /search failed with HTTP 422: bad"),
-    ui_common.APIError("Can't reach the API at http://localhost:8000."),
-])
-def test_retry_helper_does_not_retry_other_errors(error):
-    sleeps = []
-
-    def post(path, json=None):
-        raise error
-
-    with pytest.raises(ui_common.APIError):
-        _search_page_helpers()["post_with_warmup_retry"]("/search", {}, post=post, sleep=sleeps.append)
-    assert sleeps == []
-
-
-def test_page_retries_through_warm_up_then_shows_results(page):
-    replies = [warming_error(0), warming_error(0), page.fake.reply]
-
-    def post(path, json=None):
-        page.fake.posts.append((path, json))
-        reply = replies.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
-
-    ui_common.post = post  # the fixture's monkeypatch restores the original afterwards
+def test_page_says_still_starting_up_when_ui_common_gives_up(page):
+    page.fake.reply = ui_common.APIError(f"POST /search failed with HTTP 503: {rs.ENCODER_WARMING}",
+                                         status=503, retry_after=rs.ENCODER_RETRY_AFTER_S)
     at = search(page, QUERY)
-    assert len(page.fake.posts) == 3
-    assert not at.error and at.dataframe
-
-
-def test_page_gives_up_after_six_warm_up_retries(page):
-    page.fake.reply = warming_error(0)
-    at = search(page, QUERY)
-    assert len(page.fake.posts) == 7
-    assert "still starting up" in at.warning[0].value
+    assert "still starting up" in at.warning[0].value and not at.error
