@@ -690,3 +690,41 @@ def test_model_option_defaults_to_centered():
     assert strategy_config("average", "rank", 0.5, None) == strategy_config("average", "rank", 0.5, None, DEFAULT_MODEL)
     assert "model=" not in strategy_config("average", "rank", 0.5, None)
     assert strategy_config("average", "rank", 0.5, None, "ContentBasedDebiased").startswith("model=ContentBasedDebiased")
+
+
+# --- --tau for fairness_repeated --------------------------------------------------------
+
+
+def test_tau_default_is_identical_to_before():
+    from src.aggregate import TAU
+
+    assert TAU == 0.1
+    assert build_parser().parse_args([]).tau == TAU
+    cols = ["group_id", "hit", "ndcg", "group_score", "worst_member", "fairness_gap", "top_k"]
+    implicit = _rich_run(strategies=("fairness_repeated",))
+    explicit = _rich_run(strategies=("fairness_repeated",), tau=TAU)
+    pd.testing.assert_frame_equal(implicit[cols], explicit[cols])
+    # and still matches the pre-change snapshot
+    for r in implicit.itertuples():
+        assert (r.hit, r.ndcg, r.group_score, r.worst_member, r.fairness_gap) == pytest.approx(
+            PRIMARY_SNAPSHOT[(r.group_id, "fairness_repeated")], abs=1e-12)
+    assert strategy_config("fairness_repeated", "rank", 0.5, None) == strategy_config(
+        "fairness_repeated", "rank", 0.5, None, tau=TAU)
+    assert "tau=0.1" in strategy_config("fairness_repeated", "rank", 0.5, None)
+
+
+def test_tau_matches_the_sensitivity_code_path():
+    # --tau 0.3 as the strategy == the tau-sensitivity run's fairness_repeated_tau0.3 rows
+    cols = ["hit", "ndcg", "group_score", "worst_member", "fairness_gap", "top_k"]
+    direct = _rich_run(strategies=("fairness_repeated",), tau=0.3).set_index("group_id")
+    sens = _rich_run(extra_taus=(0.3,))
+    sens = sens[sens["strategy"] == "fairness_repeated_tau0.3"].set_index("group_id")
+    pd.testing.assert_frame_equal(direct[cols], sens.loc[direct.index, cols])
+    assert not direct["top_k"].equals(_rich_run(strategies=("fairness_repeated",)).set_index("group_id")["top_k"])
+
+
+def test_tau_flag_and_logged_config():
+    args = build_parser().parse_args(["--strategy", "fairness_repeated", "--tau", "0.3"])
+    assert args.tau == 0.3
+    assert strategy_config("fairness_repeated", "rank", 0.5, None, tau=0.3).endswith("tau=0.3")
+    assert "tau" not in strategy_config("average", "rank", 0.5, None, tau=0.3)
