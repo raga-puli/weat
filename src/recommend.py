@@ -24,8 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class ContentBased:
-    def __init__(self, embeddings_path=EMBEDDINGS, name="content_chunked"):
-        self.matrix, self.business_ids = load_embeddings(embeddings_path)
+    def __init__(self, embeddings_path=EMBEDDINGS, name="content_chunked", matrix=None, business_ids=None):
+        """Loads embeddings_path, or uses `matrix` / `business_ids` (raw embeddings, e.g.
+        read from Postgres) when given; subclasses transform either the same way."""
+        if matrix is not None:
+            self.matrix, self.business_ids = np.asarray(matrix), list(business_ids)
+        else:
+            self.matrix, self.business_ids = load_embeddings(embeddings_path)
         self.index = {business_id: i for i, business_id in enumerate(self.business_ids)}
         self.name = name
         self.embeddings_path = Path(embeddings_path)
@@ -150,8 +155,8 @@ class ContentBased:
 
 
 class ContentBasedBlob(ContentBased):
-    def __init__(self, embeddings_path=EMBEDDINGS_BLOB, name="content_blob"):
-        super().__init__(embeddings_path=embeddings_path, name=name)
+    def __init__(self, embeddings_path=EMBEDDINGS_BLOB, name="content_blob", **kwargs):
+        super().__init__(embeddings_path=embeddings_path, name=name, **kwargs)
 
 
 class ContentBasedCentered(ContentBased):
@@ -163,8 +168,8 @@ class ContentBasedCentered(ContentBased):
     "hub" restaurants with thin, generic category tags).
     """
 
-    def __init__(self, embeddings_path=EMBEDDINGS, name="content_centered"):
-        super().__init__(embeddings_path=embeddings_path, name=name)
+    def __init__(self, embeddings_path=EMBEDDINGS, name="content_centered", **kwargs):
+        super().__init__(embeddings_path=embeddings_path, name=name, **kwargs)
         centered = self.matrix - self.matrix.mean(axis=0)
         norms = np.linalg.norm(centered, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
@@ -183,8 +188,8 @@ class ContentBasedDebiased(ContentBasedCentered):
     Before fit, hub is zero and scores are plain cosines.
     """
 
-    def __init__(self, embeddings_path=EMBEDDINGS, name="content_debiased"):
-        super().__init__(embeddings_path=embeddings_path, name=name)
+    def __init__(self, embeddings_path=EMBEDDINGS, name="content_debiased", **kwargs):
+        super().__init__(embeddings_path=embeddings_path, name=name, **kwargs)
         self.hub = np.zeros(len(self.business_ids), dtype=self.matrix.dtype)
 
     def fit(self, train: pd.DataFrame) -> None:

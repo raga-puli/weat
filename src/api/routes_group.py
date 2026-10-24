@@ -42,6 +42,67 @@ RECOMMENDER = ContentBasedDebiased
 # --- dependencies --------------------------------------------------------------
 
 
+def data_source() -> str:
+    """DATA_SOURCE from the environment (.env): "files" (default; parquet/npy under
+    data/processed) or "db" (everything from DATABASE_URL, as filled by src.deploy_load)."""
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    source = os.getenv("DATA_SOURCE", "files").strip().lower()
+    if source not in ("files", "db"):
+        raise RuntimeError(f"DATA_SOURCE must be 'files' or 'db', not {source!r}")
+    return source
+
+
+@lru_cache(maxsize=1)
+def _db_tables() -> dict[str, pd.DataFrame]:
+    """Every table the group API needs, read once from DATABASE_URL."""
+    from src.db import get_conn
+
+    queries = {
+        # byte order, the same row order as business_ids.txt
+        "restaurants": 'SELECT business_id, name, latitude, longitude, price_level, categories, is_open, '
+                       'embedding FROM restaurants ORDER BY business_id COLLATE "C"',
+        "user_taste": "SELECT user_id, embedding FROM user_taste ORDER BY user_id",
+        "model_arrays": "SELECT name, model, n, vals FROM model_arrays",
+        "user_profiles": "SELECT user_id, rank, business_id, stars FROM user_profiles ORDER BY user_id, rank",
+        "user_visited": "SELECT user_id, business_id FROM user_visited ORDER BY user_id, business_id",
+        "sample_groups": "SELECT group_id, members, cohesion, cohesion_bucket FROM sample_groups ORDER BY group_id",
+    }
+    out = {}
+    with get_conn(connect_timeout=15) as conn, conn.cursor() as cur:
+        for name, sql in queries.items():
+            cur.execute(sql)
+            out[name] = pd.DataFrame(cur.fetchall(), columns=[d.name for d in cur.description])
+    return out
+
+
+def _as_array(value) -> np.ndarray:
+    """A pgvector value as float32: Vector objects (pgvector >= 0.4) or plain lists/arrays."""
+    return np.asarray(value.to_numpy() if hasattr(value, "to_numpy") else value, dtype=np.float32)
+
+
+def model_from_tables(tables: dict[str, pd.DataFrame]):
+    """The served model rebuilt from DB tables: raw embeddings -> RECOMMENDER's
+    transform (centering), then the stored taste vectors and hub."""
+    r = tables["restaurants"]
+    matrix = np.stack([_as_array(e) for e in r["embedding"]])
+    model = RECOMMENDER(matrix=matrix, business_ids=r["business_id"].tolist())
+    model.taste = {u: _as_array(e)
+                   for u, e in zip(tables["user_taste"]["user_id"], tables["user_taste"]["embedding"])}
+    if hasattr(model, "hub"):
+        arrays = tables["model_arrays"].set_index("name")
+        if "hub" not in arrays.index or arrays.loc["hub", "model"] != model.name:
+            raise RuntimeError(f"model_arrays has no hub for {model.name}; rerun python -m src.deploy_load")
+        hub = np.asarray(arrays.loc["hub", "vals"], dtype=np.float32)
+        if hub.shape != model.hub.shape:
+            raise RuntimeError(f"stored hub has {hub.shape[0]} entries, catalog has {model.hub.shape[0]}")
+        model.hub = hub
+    return model
+
+
 @lru_cache(maxsize=1)
 def _serving_train() -> pd.DataFrame:
     """recommend_lib.serving_train(), read once per process."""
@@ -50,18 +111,55 @@ def _serving_train() -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def get_recommender() -> ContentBasedCentered:
-    """The served model, restored from data/processed/taste_cache_<name>.npz
+    """The served model. files: restored from data/processed/taste_cache_<name>.npz
     when the cache's fingerprint matches; otherwise fit (cold path: logged as a
     warning) and the cache written. Identical state either way. Build the cache
-    ahead of time with `python -m src.recommend build-cache --model <class>`."""
+    ahead of time with `python -m src.recommend build-cache --model <class>`.
+    db: rebuilt from the database (taste vectors for the demo users only)."""
+    if data_source() == "db":
+        return model_from_tables(_db_tables())
     model = RECOMMENDER()
     recommend_lib.load_or_fit(model, train_fn=_serving_train)
     return model
 
 
+def restaurants_from_tables(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    r = tables["restaurants"]
+    return pd.DataFrame(
+        {
+            "name": r["name"].to_numpy(),
+            "categories": [None if c is None else ", ".join(c) for c in r["categories"]],
+            "price_level": [None if p is None or pd.isna(p) else int(p) for p in r["price_level"]],
+            "latitude": r["latitude"].astype(float).to_numpy(),
+            "longitude": r["longitude"].astype(float).to_numpy(),
+            "is_open": r["is_open"].fillna(False).astype(bool).to_numpy(),
+        },
+        index=pd.Index(r["business_id"], name="business_id"),
+    )
+
+
+def user_reviews_from_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """user_id -> (business_id, stars): the top-5 profile rows with their stars,
+    then the rest of the visited set with stars unknown (NaN sorts after every
+    star rating, so profiles and exclusions match files mode)."""
+    profiles = tables["user_profiles"]
+    visited = tables["user_visited"]
+    out = {}
+    for user_id, v in visited.groupby("user_id", sort=False):
+        p = profiles[profiles["user_id"] == user_id].sort_values("rank")
+        rest = sorted(set(v["business_id"]) - set(p["business_id"]))
+        out[user_id] = pd.DataFrame({
+            "business_id": list(p["business_id"]) + rest,
+            "stars": list(p["stars"].astype(float)) + [np.nan] * len(rest),
+        })
+    return out
+
+
 @lru_cache(maxsize=1)
 def get_restaurants() -> pd.DataFrame:
     """business_id -> name, categories, price_level, latitude, longitude, is_open."""
+    if data_source() == "db":
+        return restaurants_from_tables(_db_tables())
     from src.db import _as_dict, parse_price_level
 
     r = pd.read_parquet(interfaces.RESTAURANTS)
@@ -84,6 +182,8 @@ def get_restaurants() -> pd.DataFrame:
 @lru_cache(maxsize=1)
 def get_user_reviews() -> dict[str, pd.DataFrame]:
     """user_id -> that user's train reviews (business_id, stars), for served users."""
+    if data_source() == "db":
+        return user_reviews_from_tables(_db_tables())
     train = _serving_train().sort_values("user_id", kind="stable")
     users = train["user_id"].to_numpy()
     starts = np.flatnonzero(np.r_[True, users[1:] != users[:-1]])
@@ -94,11 +194,19 @@ def get_user_reviews() -> dict[str, pd.DataFrame]:
 
 @lru_cache(maxsize=1)
 def get_val_users() -> tuple[str, ...]:
+    """Users /users/sample may draw (cohesion=any). db: the demo users."""
+    if data_source() == "db":
+        return tuple(sorted(_db_tables()["user_taste"]["user_id"]))
     return tuple(sorted(set(pd.read_parquet(interfaces.VAL_REVIEWS, columns=["user_id"])["user_id"])))
 
 
 @lru_cache(maxsize=1)
 def get_val_groups() -> pd.DataFrame:
+    """Groups /users/sample draws from for cohesion=high/low. db: the precomputed
+    sample_groups, which carry their own cohesion_bucket."""
+    if data_source() == "db":
+        g = _db_tables()["sample_groups"]
+        return g.assign(members=g["members"].map(list)).reset_index(drop=True)
     groups = pd.read_parquet(GROUPS)
     return groups[groups["split"] == "val"].reset_index(drop=True)
 
@@ -288,9 +396,14 @@ def sample_users(
         groups = groups[groups["members"].map(lambda ms: all(m in model.taste for m in ms))]
         if groups.empty:
             raise HTTPException(status_code=422, detail=f"no val group has {n} or more members")
-        values = groups["members"].map(lambda ms: _cohesion(np.stack([model.taste[m] for m in ms])))
-        median = float(values.median())
-        bucket = groups[values > median] if cohesion == "high" else groups[values <= median]
+        if "cohesion_bucket" in groups.columns:  # db: sample_groups were bucketed at load time
+            bucket = groups[groups["cohesion_bucket"] == cohesion]
+        else:
+            values = groups["members"].map(lambda ms: _cohesion(np.stack([model.taste[m] for m in ms])))
+            median = float(values.median())
+            bucket = groups[values > median] if cohesion == "high" else groups[values <= median]
+        if bucket.empty:
+            raise HTTPException(status_code=422, detail=f"no {cohesion}-cohesion group has {n} or more members")
         row = bucket.iloc[int(rng.integers(len(bucket)))]
         group_id = row["group_id"]
         users = sorted(rng.choice(list(row["members"]), size=n, replace=False).tolist())

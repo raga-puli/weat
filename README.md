@@ -224,6 +224,7 @@ streamlit run src/app.py                                           # UI on :8501
 ```
 
 - **τ default:** the API's `tau` defaults to 0.1, the pre-registered evaluation setting. The Group Dinner page defaults to 0.3, which performed better per dinner on validation (see "τ sensitivity").
+- **Hosted mode:** with `DATA_SOURCE=db` the API reads everything from `DATABASE_URL` instead of `data/processed/` (only the demo users loaded by `python -m src.deploy_load` are served). See `deploy/README.md`.
 - **Closed restaurants** are excluded by default (`include_closed=false`), and so is anything a member already reviewed (`exclude_visited=true`).
 - **Chains:** the page asks for k + 5 results and collapses repeat locations of a chain into one row, "(N locations)". fairness_repeated is a dinner sequence, so its list is shown uncollapsed, with repeat locations labelled "(another location)".
 
