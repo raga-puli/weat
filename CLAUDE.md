@@ -6,15 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A group restaurant recommender built from the Yelp Academic Dataset, scoped to Philadelphia restaurants (see README.md). The pipeline: raw Yelp JSON -> filtered/joined Parquet tables (DuckDB) -> sentence embeddings per restaurant (SentenceTransformers) -> recommendation models -> offline evaluation against a held-out split.
 
-## File ownership (WEEK 3)
+## File ownership (WEEK 4)
 
-Supersedes the week 2 table; week 3 = everything each person owned in week 2 plus the new files.
+Supersedes the week 3 table; week 4 = everything each person owned in week 3 plus the new files.
 
 | Person | Owns |
 | --- | --- |
-| A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `src/groups.py`, `src/aggregate.py`, `src/group_eval.py`, `src/db_groups.py`, `db/groups.sql`, `results/groups.md`, `tests/test_groups.py`, `tests/test_aggregate.py`, `tests/test_group_eval.py`, `tests/test_embed.py`, `tests/test_recommend.py`, `README.md`, `src/api/routes_group.py`, `src/pages/1_Group_Dinner.py`, `src/mf.py`, `tests/test_api_group.py`, `tests/test_mf.py` |
-| B | `src/eval.py`, `src/baselines.py`, `results.md`, `src/query_parser.py`, `src/search.py`, `src/db.py`, `src/bench.py`, `docker-compose.yml`, `eval/queries.jsonl`, `results/parser.md`, `results/latency.md`, `tests/test_query_parser.py`, `tests/test_search.py`, `src/api/routes_search.py`, `src/pages/2_Search.py`, `Dockerfile`, `.dockerignore`, `tests/test_api_search.py` |
-| Shared, FROZEN | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore`, `.env.example`, `db/schema.sql`, `src/api/main.py`, `src/app.py`, `src/ui_common.py` |
+| A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `src/groups.py`, `src/aggregate.py`, `src/group_eval.py`, `src/db_groups.py`, `db/groups.sql`, `results/groups.md`, `tests/test_groups.py`, `tests/test_aggregate.py`, `tests/test_group_eval.py`, `tests/test_embed.py`, `tests/test_recommend.py`, `README.md`, `src/api/routes_group.py`, `src/pages/1_Group_Dinner.py`, `src/mf.py`, `tests/test_api_group.py`, `tests/test_mf.py`, `src/deploy_load.py`, `deploy/` (all files), `docs/search.md` |
+| B | `src/eval.py`, `src/baselines.py`, `results.md`, `src/query_parser.py`, `src/search.py`, `src/db.py`, `src/bench.py`, `docker-compose.yml`, `eval/queries.jsonl`, `results/parser.md`, `results/latency.md`, `tests/test_query_parser.py`, `tests/test_search.py`, `src/api/routes_search.py`, `src/pages/2_Search.py`, `Dockerfile`, `.dockerignore`, `tests/test_api_search.py`, `src/pages/3_Blind_Eval.py`, `src/human_eval.py`, `docs/human_eval_protocol.md`, `docs/groups.md`, `results/human_eval.md` |
+| Shared, FROZEN | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore`, `.env.example`, `db/schema.sql`, `src/api/main.py`, `src/app.py`, `src/ui_common.py`, `docs/frozen_configs.md` |
 
 ### Rules
 
@@ -22,7 +22,10 @@ Supersedes the week 2 table; week 3 = everything each person owned in week 2 plu
 - Never edit frozen files; if a change seems necessary, stop and tell the user instead.
 - Results logging: `results.md` is written only by `python -m src.eval --log`; `results/groups.md` (Person A) is written only by `python -m src.group_eval --log`. Never edit either by hand.
 - Never evaluate on the test split unless the user explicitly says so.
+- The test split is run exactly once per model, on Day 1, using docs/frozen_configs.md. Never rerun test to get a better number.
 - Never commit anything under `data/`.
+- No Yelp data (parquet, npy, review text, embeddings) is ever committed or copied into deploy/; the hosted API reads everything from DATABASE_URL.
+- Writing in docs/ must be drafted by the person, not generated; Claude may outline, quiz, and fact-check.
 - Group evaluation uses the val group split unless the user explicitly says test.
 - Never commit secrets; read config from .env.
 - Only write results files through their owning script's --log flag.
