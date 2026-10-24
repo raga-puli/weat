@@ -155,6 +155,7 @@ def evaluate_groups(
     diagnostics: bool = False,
     strategies: tuple[str, ...] = ALL_STRATEGIES,
     lam: float = LAMBDA,
+    tau: float = TAU,
 ) -> tuple[pd.DataFrame, dict]:
     """One row per (surviving group, strategy). Returns (rows, drop counts).
 
@@ -230,7 +231,7 @@ def evaluate_groups(
                 tops[strategy] = AGGREGATORS[strategy](scores, excluded, k, norm=normalization, lam=lam)
             elif strategy == "fairness_repeated":
                 picks, history, weights = fairness_repeated(
-                    scores, excluded, k, norm=normalization, return_weights=True
+                    scores, excluded, k, norm=normalization, tau=tau, return_weights=True
                 )
                 tops[strategy] = picks
                 if diagnostics:
@@ -509,14 +510,14 @@ def tercile_table(results: pd.DataFrame) -> pd.DataFrame:
 
 
 def strategy_config(strategy: str, normalization: str, lam: float, sample: int | None,
-                    model: str = DEFAULT_MODEL) -> str:
+                    model: str = DEFAULT_MODEL, tau: float = TAU) -> str:
     parts = [f"norm={normalization}", f"k={K}", "groups: >=3 prior likes, <=10/user"]
     if model != DEFAULT_MODEL:
         parts.insert(0, f"model={model}")
     if strategy == "fairness":
         parts.append(f"lam={lam:g}")
     if strategy == "fairness_repeated":
-        parts.append(f"tau={TAU:g}")
+        parts.append(f"tau={tau:g}")
     if sample is not None:
         parts.append(f"sample={sample}")
     return "; ".join(parts)
@@ -558,6 +559,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"append one row per strategy to {GROUPS_RESULTS}")
     parser.add_argument("--model", choices=sorted(MODELS), default=DEFAULT_MODEL,
                         help="recommender class (default ContentBasedCentered)")
+    parser.add_argument("--tau", type=float, default=TAU,
+                        help=f"fairness_repeated temperature (default {TAU:g}, the pre-registered setting)")
     parser.add_argument("--tau-sensitivity", action="store_true",
                         help="sensitivity analysis of fairness_repeated's tau (separate CSV)")
     return parser
@@ -661,6 +664,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.split == "test" and not args.i_mean_it:
         parser.error("refusing to evaluate on the test split without --i-mean-it")
+    if args.tau_sensitivity and args.tau != TAU:
+        parser.error("--tau-sensitivity runs its own fixed tau values; don't combine it with --tau")
     if args.tau_sensitivity and (args.strategy or args.log):
         parser.error("--tau-sensitivity runs every strategy and never logs")
     strategies = selected_strategies(args)
@@ -681,7 +686,7 @@ if __name__ == "__main__":
     extra_taus = (*[t for t in SENSITIVITY_TAUS if t != TAU], 1e6) if args.tau_sensitivity else ()
     results, drops = evaluate_groups(groups, train, model, normalization=args.normalization,
                                      extra_taus=extra_taus, diagnostics=args.tau_sensitivity,
-                                     strategies=strategies, lam=args.lam)
+                                     strategies=strategies, lam=args.lam, tau=args.tau)
     n_survive = results["group_id"].nunique() if len(results) else 0
     print(f"{args.split} groups: {len(groups)}  surviving: {n_survive}")
     for reason, n in drops.items():
@@ -728,7 +733,7 @@ if __name__ == "__main__":
     compare = len(strategies) > 1 and "average" in strategies
     pd.set_option("display.width", 220)
     print(f"\n== {args.split}, model={model.name}, normalization={args.normalization}, "
-          f"lam={args.lam:g}, k={K} ({boot}) ==")
+          f"lam={args.lam:g}, tau={args.tau:g}, k={K} ({boot}) ==")
     print(main_table_with_ci(results).round(4).to_string())
     print(summarize(results, ["strategy"]).round(4).to_string())
     if compare:
@@ -769,6 +774,7 @@ if __name__ == "__main__":
     suffix = model_suffix
     suffix += "" if args.normalization == "rank" else f"_{args.normalization}"
     suffix += f"_lam{args.lam:g}" if args.lam != LAMBDA else ""
+    suffix += f"_tau{args.tau:g}" if args.tau != TAU else ""
     suffix += f"_{args.strategy}" if args.strategy else ""
     suffix += f"_sample{args.sample}" if args.sample is not None else ""
     out = DATA / f"group_eval_{args.split}{suffix}.csv"
@@ -778,6 +784,7 @@ if __name__ == "__main__":
     print(f"\nwrote {out}\nwrote {lists_out}")
 
     if args.log is not None:
-        configs = {s: strategy_config(s, args.normalization, args.lam, args.sample, args.model) for s in strategies}
+        configs = {s: strategy_config(s, args.normalization, args.lam, args.sample, args.model, args.tau)
+                   for s in strategies}
         n = log_results(results, args.split, args.log, configs)
         print(f"logged {n} rows to {GROUPS_RESULTS}")
