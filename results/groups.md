@@ -22,3 +22,4 @@ hit@10 and NDCG@10 are against the held-out target. CIs are cluster bootstraps o
 | 2026-10-24 | test | least_misery | norm=rank; k=10; groups: >=3 prior likes, <=10/user | 2994 | 0.0150 [0.0101, 0.0207] | 0.0072 | 0.9005 | 0.8778 | 0.0476 | test, frozen |
 | 2026-10-24 | test | fairness | norm=rank; k=10; groups: >=3 prior likes, <=10/user; lam=0.5 | 2994 | 0.0147 [0.0095, 0.0208] | 0.0067 | 0.9028 | 0.8774 | 0.0494 | test, frozen |
 | 2026-10-24 | test | fairness_repeated | norm=rank; k=10; groups: >=3 prior likes, <=10/user; tau=0.1 | 2994 | 0.0180 [0.0126, 0.0241] | 0.0089 | 0.8840 | 0.8706 | 0.0287 | test, frozen |
+| 2026-10-24 | test | fairness_repeated | norm=rank; k=10; groups: >=3 prior likes, <=10/user; tau=0.3 | 2994 | 0.0167 [0.0109, 0.0229] | 0.0084 | 0.9051 | 0.8908 | 0.0317 | test, frozen |

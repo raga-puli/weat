@@ -152,6 +152,57 @@ Every group-evaluation configuration run on val, with how it can be verified. Al
 
 The `--normalization raw` and `zscore` options exist in `src/group_eval.py`, but no val output for them exists and they have not been run. Individual-user (non-group) val runs are logged separately in `results.md` (random, popularity, content_chunked, content_blob). `ContentBasedCentered` and `ContentBasedDebiased` were also evaluated individually on full val (the "Hubness correction" table) but not logged, since `results.md` is B's; those numbers come from the run output only and are reproducible with `python -m src.eval --model src.recommend:ContentBasedCentered` / `:ContentBasedDebiased`.
 
+## Test results
+
+Group evaluation on the **test** group split, each configuration run exactly once on 2026-10-24 with the invocations in `docs/frozen_configs.md` (`ContentBasedCentered`, rank normalization, k = 10). 2,994 of 3,095 test groups survive (101 dropped: a member had reviewed the target before the window); 998 targets. 95% CIs are cluster bootstraps over targets. Group score, worst member and fairness gap are **predicted** (member rank percentiles). Rows are in `results/groups.md` ("test, frozen"). Random and popularity were not run on test: they are not in the frozen group configurations.
+
+| strategy | hit@10 [95% CI] | NDCG@10 | group score | worst member | fairness gap |
+| --- | --- | --- | --- | --- | --- |
+| average | 0.0177 [0.0122, 0.0237] | 0.0086 | 0.913 | 0.858 | 0.098 |
+| least_misery | 0.0150 [0.0101, 0.0207] | 0.0072 | 0.901 | 0.878 | 0.048 |
+| fairness (λ=0.5) | 0.0147 [0.0095, 0.0208] | 0.0067 | 0.903 | 0.877 | 0.049 |
+| fairness_repeated (τ=0.1) | 0.0180 [0.0126, 0.0241] | 0.0089 | 0.884 | 0.871 | 0.029 |
+| fairness_repeated (τ=0.3) | 0.0167 [0.0109, 0.0229] | 0.0084 | 0.905 | 0.891 | 0.032 |
+
+No hit@10 difference between strategies over all test groups has a CI that excludes zero.
+
+### Pre-registered hypothesis: held
+
+Low-cohesion half (1,497 groups, 726 targets), fairness_repeated (τ=0.3) minus least_misery, paired cluster bootstrap:
+
+- **(a) Higher worst-member predicted percentile: held.** +0.019 [+0.018, +0.019].
+- **(b) Smaller group-score cost: held.** Group score +0.005 [+0.005, +0.006] higher than least_misery's. Relative to average, the cost is −0.012 [−0.013, −0.012] for τ=0.3 against −0.018 [−0.018, −0.017] for least_misery, while the worst-member gain is +0.047 [+0.045, +0.050] against +0.029 [+0.027, +0.031].
+
+Both parts are on predicted scores, which are weakly calibrated to star ratings (see Calibration). On hit@10 in the low-cohesion half, τ=0.3 scores 0.0107 (16 hits) against least_misery's 0.0080 (12 hits) and average's 0.0127 (19 hits); none of these differences is distinguishable.
+
+τ=0.1, the original default reported regardless: in the low-cohesion half it gives the smallest worst-member gain over average (+0.009 [+0.007, +0.011]) at the largest group-score cost (−0.050 [−0.052, −0.047]), the same pattern as on val.
+
+### Post-hoc: does strategy matter more for low-cohesion groups?
+
+Not pre-registered. Differences vs. average by cohesion half:
+
+| cohesion | strategy | worst member Δ | group score Δ | hit@10 (hits) | hit@10 Δ |
+| --- | --- | --- | --- | --- | --- |
+| high (n=1,497) | average | — (0.916) | — (0.950) | 0.0227 (34) | — |
+| | least_misery | +0.011 [+0.010, +0.012] | −0.007 [−0.008, −0.007] | 0.0220 (33) | −0.001 [−0.007, +0.005] |
+| | fairness (λ=0.5) | +0.011 [+0.010, +0.012] | −0.005 [−0.005, −0.005] | 0.0227 (34) | 0.000 [−0.005, +0.005] |
+| | fairness_repeated (τ=0.1) | +0.017 [+0.016, +0.018] | −0.008 [−0.009, −0.008] | 0.0234 (35) | +0.001 [−0.004, +0.005] |
+| | fairness_repeated (τ=0.3) | +0.019 [+0.017, +0.020] | −0.003 [−0.004, −0.003] | 0.0227 (34) | 0.000 [−0.004, +0.004] |
+| low (n=1,497) | average | — (0.799) | — (0.876) | 0.0127 (19) | — |
+| | least_misery | +0.029 [+0.027, +0.031] | −0.018 [−0.018, −0.017] | 0.0080 (12) | −0.005 [−0.010, 0.000] |
+| | fairness (λ=0.5) | +0.028 [+0.027, +0.030] | −0.015 [−0.016, −0.015] | 0.0067 (10) | −0.006 [−0.012, −0.001] |
+| | fairness_repeated (τ=0.1) | +0.009 [+0.007, +0.011] | −0.050 [−0.052, −0.047] | 0.0127 (19) | 0.000 [−0.006, +0.006] |
+| | fairness_repeated (τ=0.3) | +0.047 [+0.045, +0.050] | −0.012 [−0.013, −0.012] | 0.0107 (16) | −0.002 [−0.007, +0.003] |
+
+On predicted scores, yes: in high-cohesion groups every strategy is within about 0.02 of average, and in low-cohesion groups the worst-member gains and group-score costs are 2–3 times larger. The absolute effects are still small (at most 0.05 of a percentile point). On hit@10, strategy makes no difference in high-cohesion groups; in low-cohesion groups least_misery and fairness lose hits relative to average (fairness's CI excludes zero; least_misery's ends at zero), while both fairness_repeated settings are indistinguishable from average.
+
+### Caveats
+
+- Cohesion halves are a median split within test (median cohesion 0.119, using pre-window profiles), so "high" and "low" are relative, not fixed thresholds.
+- 730 of the 2,994 test groups are flagged for a possible target-embedding leak (a member's own review of the target is among those encoded into its embedding), as on val.
+- Low-cohesion hit@10 cells rest on 10–19 hits each, so those comparisons are fragile.
+- **Amendment:** the τ=0.3 configuration was missing from the original frozen list in error and was added to `docs/frozen_configs.md` after the four other group test runs, then run once. This doesn't involve choosing a configuration from test results: τ=0.3 and the hypothesis it tests were fixed in the 2026-10-17 pre-registration, before any test-split evaluation, and the τ=0.1 results are reported alongside regardless.
+
 ## Known gaps
 
 - Hours come from the dataset snapshot, so "open now" means open per the hours listed when the data was captured.
