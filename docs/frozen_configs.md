@@ -1,6 +1,6 @@
 # Frozen test configurations
 
-Frozen on: <date>
+Frozen on: 2026-10-24
 
 Each model is run on the test split exactly once, on Day 1, with the invocation below. Never rerun test to get a better number. Val rows cited are from `results.md` (individual) and `results/groups.md` (groups).
 
