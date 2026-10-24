@@ -227,27 +227,77 @@ def test_anchors(client):
 # ---------- startup warm-up ----------
 
 
-def test_warm_up_loads_encoder_and_db_and_preloads_llm(monkeypatch):
+@pytest.fixture
+def no_real_encoder(monkeypatch):
+    """Warm-up and get_encoder use FakeEncoder; the warming flag starts and ends cleared."""
     calls = []
-    monkeypatch.setattr(rs, "get_encoder", lambda: calls.append("encoder") or FakeEncoder())
+    fake = rs.lru_cache(maxsize=1)(lambda: calls.append("encoder") or FakeEncoder())
+    monkeypatch.setattr(rs, "_load_encoder", fake)
+    rs._encoder_warming.clear()
+    yield calls
+    rs._encoder_warming.clear()
+
+
+def test_warm_up_loads_encoder_and_db_and_preloads_llm(monkeypatch, no_real_encoder):
+    calls = no_real_encoder
     monkeypatch.setattr(rs, "get_db_conn", lambda: calls.append("db"))
     monkeypatch.setattr(rs, "preload_llm", lambda: calls.append("llm"))
     rs._warm_up()
     assert set(calls) == {"encoder", "db", "llm"}
+    assert not rs._encoder_warming.is_set()
 
 
-def test_warm_up_survives_db_down(monkeypatch):
-    monkeypatch.setattr(rs, "get_encoder", FakeEncoder)
+def test_warm_up_survives_db_down(monkeypatch, no_real_encoder):
     monkeypatch.setattr(rs, "get_db_conn", db_down)
     monkeypatch.setattr(rs, "preload_llm", lambda: None)
     rs._warm_up()  # logs, doesn't raise
 
 
-def test_lifespan_is_registered_on_the_app(monkeypatch):
+def test_warm_up_survives_encoder_failure_and_search_retries_the_load(monkeypatch, no_real_encoder):
+    def broken():
+        raise OSError("model download failed")
+
+    monkeypatch.setattr(rs, "_load_encoder", broken)
+    monkeypatch.setattr(rs, "get_db_conn", lambda: None)
+    monkeypatch.setattr(rs, "preload_llm", lambda: None)
+    rs._warm_up()  # logs, doesn't raise
+    assert not rs._encoder_warming.is_set()  # /search tries again instead of 503-ing forever
+
+
+def test_startup_does_not_wait_for_the_warm_up(monkeypatch, no_real_encoder):
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(rs, "_warm_up", lambda: release.wait(10))
+    try:
+        with TestClient(app) as c:  # startup returns while the warm-up is still blocked
+            assert c.get("/health").status_code == 200
+            assert rs._warm_up_thread.is_alive()
+    finally:
+        release.set()
+        rs._warm_up_thread.join(5)
+
+
+def test_search_is_503_while_the_encoder_warms_up_and_parse_still_works(client, no_real_encoder):
+    app.dependency_overrides.pop(rs.get_encoder)
+    rs._encoder_warming.set()
+    response = client.post("/search", json={"text": QUERY, "backend": "numpy"})
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == str(rs.ENCODER_RETRY_AFTER_S)
+    assert "starting up" in response.json()["detail"]
+    assert client.post("/search/parse", json={"text": QUERY}).status_code == 200
+
+    rs._encoder_warming.clear()  # warm-up finished
+    assert client.post("/search", json={"text": QUERY, "backend": "numpy"}).status_code == 200
+    assert no_real_encoder == ["encoder"]
+
+
+def test_lifespan_runs_the_warm_up(monkeypatch, no_real_encoder):
     warmed = []
     monkeypatch.setattr(rs, "_warm_up", lambda: warmed.append(True))
     with TestClient(app) as c:
         assert c.get("/health").status_code == 200
+    rs._warm_up_thread.join(5)
     assert warmed == [True]
 
 
@@ -436,3 +486,109 @@ def test_failed_manual_rerun_keeps_the_previous_results(page):
     [b for b in page.button if b.label == "Rerun with these filters"][0].click().run()
     assert any("rejected" in w.value for w in page.warning)
     assert page.dataframe  # still showing the last good results
+
+
+# ---------- warm-up 503 retry (page stopgap) ----------
+
+
+def _search_page_helpers() -> dict:
+    """The page's retry helpers, without running the page: its module-level code is Streamlit UI,
+    so only the names below are compiled, from the page's own source."""
+    import ast
+    import re
+    import time
+
+    names = {"WARMING_RE", "MAX_WARMING_RETRIES", "WARMING_MESSAGE", "warming_retry_after",
+             "post_with_warmup_retry"}
+    tree = ast.parse(Path(PAGE).read_text(encoding="utf-8"))
+    keep = [n for n in tree.body
+            if (isinstance(n, ast.FunctionDef) and n.name in names)
+            or (isinstance(n, ast.Assign) and {getattr(t, "id", None) for t in n.targets} & names)]
+    namespace = {"re": re, "time": time, "ui_common": ui_common}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), PAGE, "exec"), namespace)
+    return namespace
+
+
+def warming_error(seconds=rs.ENCODER_RETRY_AFTER_S):
+    """What ui_common raises for the API's warm-up 503 (it keeps only the message)."""
+    detail = rs.ENCODER_WARMING.replace(f"{rs.ENCODER_RETRY_AFTER_S} s", f"{seconds} s")
+    return ui_common.APIError(f'POST /search failed with HTTP 503: {{"detail":"{detail}"}}')
+
+
+def test_warming_message_matches_the_api(client):
+    app.dependency_overrides.pop(rs.get_encoder)
+    rs._encoder_warming.set()
+    try:
+        response = client.post("/search", json={"text": QUERY, "backend": "numpy"})
+    finally:
+        rs._encoder_warming.clear()
+    err = ui_common.APIError(f"POST /search failed with HTTP {response.status_code}: {response.text[:300]}")
+    assert _search_page_helpers()["warming_retry_after"](err) == int(response.headers["retry-after"])
+
+
+def test_retry_helper_honors_retry_after_and_stops_after_six():
+    helpers = _search_page_helpers()
+    post_with_warmup_retry = helpers["post_with_warmup_retry"]
+
+    sleeps, retries = [], []
+    replies = [warming_error(10), warming_error(3), {"ok": True}]
+
+    def post(path, json=None):
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    result = post_with_warmup_retry("/search", {"text": "x"}, post=post, sleep=sleeps.append,
+                                    on_retry=lambda attempt, delay: retries.append((attempt, delay)))
+    assert result == {"ok": True} and sleeps == [10, 3] and retries == [(1, 10), (2, 3)]
+
+    sleeps.clear()
+    calls = []
+
+    def always_warming(path, json=None):
+        calls.append(path)
+        raise warming_error(10)
+
+    with pytest.raises(ui_common.APIError, match="starting up"):
+        post_with_warmup_retry("/search", {}, post=always_warming, sleep=sleeps.append)
+    assert helpers["MAX_WARMING_RETRIES"] == 6 and len(calls) == 7 and sleeps == [10] * 6
+
+
+@pytest.mark.parametrize("error", [
+    ui_common.APIError('POST /search failed with HTTP 503: {"detail":"Database unavailable."}'),  # no retry hint
+    ui_common.APIError("POST /search failed with HTTP 422: bad"),
+    ui_common.APIError("Can't reach the API at http://localhost:8000."),
+])
+def test_retry_helper_does_not_retry_other_errors(error):
+    sleeps = []
+
+    def post(path, json=None):
+        raise error
+
+    with pytest.raises(ui_common.APIError):
+        _search_page_helpers()["post_with_warmup_retry"]("/search", {}, post=post, sleep=sleeps.append)
+    assert sleeps == []
+
+
+def test_page_retries_through_warm_up_then_shows_results(page):
+    replies = [warming_error(0), warming_error(0), page.fake.reply]
+
+    def post(path, json=None):
+        page.fake.posts.append((path, json))
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    ui_common.post = post  # the fixture's monkeypatch restores the original afterwards
+    at = search(page, QUERY)
+    assert len(page.fake.posts) == 3
+    assert not at.error and at.dataframe
+
+
+def test_page_gives_up_after_six_warm_up_retries(page):
+    page.fake.reply = warming_error(0)
+    at = search(page, QUERY)
+    assert len(page.fake.posts) == 7
+    assert "still starting up" in at.warning[0].value
