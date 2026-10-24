@@ -18,3 +18,7 @@ hit@10 and NDCG@10 are against the held-out target. CIs are cluster bootstraps o
 | 2026-10-18 | val | least_misery | model=ContentBasedDebiased; norm=rank; k=10; groups: >=3 prior likes, <=10/user | 7008 | 0.0140 [0.0108, 0.0173] | 0.0071 | 0.8888 | 0.8645 | 0.0513 | debiased model, val |
 | 2026-10-18 | val | fairness | model=ContentBasedDebiased; norm=rank; k=10; groups: >=3 prior likes, <=10/user; lam=0.5 | 7008 | 0.0153 [0.0117, 0.0191] | 0.0076 | 0.8911 | 0.8645 | 0.0524 | debiased model, val |
 | 2026-10-18 | val | fairness_repeated | model=ContentBasedDebiased; norm=rank; k=10; groups: >=3 prior likes, <=10/user; tau=0.1 | 7008 | 0.0163 [0.0128, 0.0200] | 0.0082 | 0.8666 | 0.8520 | 0.0310 | debiased model, val |
+| 2026-10-24 | test | average | norm=rank; k=10; groups: >=3 prior likes, <=10/user | 2994 | 0.0177 [0.0122, 0.0237] | 0.0086 | 0.9129 | 0.8578 | 0.0982 | test, frozen |
+| 2026-10-24 | test | least_misery | norm=rank; k=10; groups: >=3 prior likes, <=10/user | 2994 | 0.0150 [0.0101, 0.0207] | 0.0072 | 0.9005 | 0.8778 | 0.0476 | test, frozen |
+| 2026-10-24 | test | fairness | norm=rank; k=10; groups: >=3 prior likes, <=10/user; lam=0.5 | 2994 | 0.0147 [0.0095, 0.0208] | 0.0067 | 0.9028 | 0.8774 | 0.0494 | test, frozen |
+| 2026-10-24 | test | fairness_repeated | norm=rank; k=10; groups: >=3 prior likes, <=10/user; tau=0.1 | 2994 | 0.0180 [0.0126, 0.0241] | 0.0089 | 0.8840 | 0.8706 | 0.0287 | test, frozen |
