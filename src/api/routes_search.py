@@ -13,11 +13,12 @@ Heavy resources come from lru_cache getters (get_db_conn, get_encoder, get_searc
 dependencies, so tests can swap them with app.dependency_overrides. The DB connection and the parquet
 frame are handed out as zero-argument providers so backend=numpy never connects to Postgres and
 backend=sql never reads the parquet; backend=numpy without the data files is a 400. At server start (the router's lifespan, merged into the app by
-include_router) the encoder and DB connection are warmed and Ollama starts loading its model, so the
-first search doesn't pay ~50 s of torch import; TestClient without `with` skips this.
+include_router) a background thread warms the encoder and DB connection and Ollama starts loading its
+model, so the first search doesn't pay ~50 s of torch import. Startup doesn't wait for it: /health and
+/search/parse answer at once, and /search returns 503 (Retry-After) until the encoder is loaded.
+TestClient without `with` skips the warm-up; /search then loads the encoder on first use.
 """
 
-import asyncio
 import logging
 import threading
 import time
@@ -41,23 +42,37 @@ log = logging.getLogger(__name__)
 def _warm_up() -> None:
     threading.Thread(target=preload_llm, daemon=True).start()  # engine=llm falls back until it's ready
     start = time.perf_counter()
-    get_encoder().encode("warm up", normalize_embeddings=True)
+    _encoder_warming.set()
+    try:
+        with _encoder_lock:
+            _load_encoder().encode("warm up", normalize_embeddings=True)
+    except Exception as err:  # e.g. the model download failed; /search retries the load on first use
+        log.warning("search warm-up: encoder failed to load (%s: %s)", type(err).__name__, err)
+    finally:
+        _encoder_warming.clear()
+    log.warning("search warm-up: encoder ready in %.1fs", time.perf_counter() - start)
     try:
         get_db_conn()
     except (psycopg.OperationalError, RuntimeError) as err:
         log.warning("search warm-up: Postgres unavailable (%s); backend=sql will return 503 until it is", err)
-    log.warning("search warm-up done in %.1fs", time.perf_counter() - start)
 
 
 @asynccontextmanager
 async def _lifespan(app):
-    await asyncio.to_thread(_warm_up)
+    global _warm_up_thread
+    _encoder_warming.set()  # before the thread starts, so no request slips into a second load
+    _warm_up_thread = threading.Thread(target=_warm_up, daemon=True, name="search-warm-up")
+    _warm_up_thread.start()
     yield
 
 
 router = APIRouter(prefix="/search", tags=["search"], lifespan=_lifespan)
 
 DB_CONNECT_TIMEOUT_S = 5
+ENCODER_RETRY_AFTER_S = 10
+# The number is repeated in the text because ui_common.py (frozen) drops response headers; the Search
+# page reads it from there until ui_common gets shared 503 handling.
+ENCODER_WARMING = f"Search is starting up (loading the text encoder). Retry in {ENCODER_RETRY_AFTER_S} s."
 DB_UNAVAILABLE = "Database unavailable. Start Postgres with `docker compose up -d`, or retry with backend=numpy."
 NUMPY_DATA_MISSING = (
     "backend=numpy needs the local data files, and {path} is missing. Build them with the pipeline "
@@ -77,9 +92,23 @@ def get_db_conn() -> psycopg.Connection:
     return conn
 
 
+_encoder_lock = threading.Lock()  # one load at a time (lru_cache alone would let two threads both load)
+_encoder_warming = threading.Event()  # set while the startup warm-up is loading the encoder
+_warm_up_thread: threading.Thread | None = None
+
+
 @lru_cache(maxsize=1)
-def get_encoder():
+def _load_encoder():
     return search.load_encoder()
+
+
+def get_encoder():
+    """The encoder; 503 while the startup warm-up is still loading it."""
+    if _encoder_warming.is_set():
+        raise HTTPException(status_code=503, detail=ENCODER_WARMING,
+                            headers={"Retry-After": str(ENCODER_RETRY_AFTER_S)})
+    with _encoder_lock:
+        return _load_encoder()
 
 
 @lru_cache(maxsize=1)
