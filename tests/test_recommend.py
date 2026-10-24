@@ -348,3 +348,67 @@ def test_load_or_fit_cold_then_warm(monkeypatch, tmp_path, caplog):
     assert caplog.text == ""
     assert list(warm.taste) == list(cold.taste)
     np.testing.assert_array_equal(warm.hub, cold.hub)
+
+
+# --- ContentBased.taste_vector_from / scores_for --------------------------
+
+
+TINY_IDS = ["r0", "r1", "r2", "r3"]
+TINY = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.6, 0.8, 0.0],
+        [0.0, 0.6, 0.8],
+    ],
+    dtype="float32",
+)
+
+
+@pytest.fixture
+def tiny_embeddings(monkeypatch):
+    monkeypatch.setattr(recommend_module, "load_embeddings", lambda path: (TINY.copy(), list(TINY_IDS)))
+
+
+def test_taste_vector_skips_unknown_ids(tiny_embeddings):
+    model = ContentBased()
+    np.testing.assert_allclose(
+        model.taste_vector_from(["r0", "nope", "r1"]), model.taste_vector_from(["r0", "r1"])
+    )
+
+
+def test_taste_vector_none_when_nothing_known(tiny_embeddings):
+    model = ContentBased()
+    assert model.taste_vector_from([]) is None
+    assert model.taste_vector_from(["nope", "also-nope"]) is None
+
+
+def test_taste_vector_is_unit_norm_mean(tiny_embeddings):
+    model = ContentBased()
+    taste = model.taste_vector_from(["r0", "r1"])
+    np.testing.assert_allclose(np.linalg.norm(taste), 1.0, rtol=1e-6)
+    np.testing.assert_allclose(taste, np.array([1, 1, 0]) / np.sqrt(2), rtol=1e-6)
+
+
+def test_centered_model_uses_centered_matrix(tiny_embeddings):
+    model = ContentBasedCentered()
+    centered = TINY - TINY.mean(axis=0)
+    centered /= np.linalg.norm(centered, axis=1, keepdims=True)
+    np.testing.assert_allclose(model.matrix, centered, rtol=1e-6)
+
+    expected = centered[[0, 2]].mean(axis=0)
+    expected /= np.linalg.norm(expected)
+    np.testing.assert_allclose(model.taste_vector_from(["r0", "r2"]), expected, rtol=1e-5)
+    # and differs from the uncentered model's vector
+    assert not np.allclose(model.taste_vector_from(["r0", "r2"]), ContentBased().taste_vector_from(["r0", "r2"]))
+
+
+def test_scores_for_follows_business_ids_order(tiny_embeddings):
+    for model in (ContentBased(), ContentBasedCentered()):
+        taste = model.taste_vector_from(["r3"])
+        scores = model.scores_for(taste)
+        assert scores.shape == (len(TINY_IDS),)
+        for i, b in enumerate(model.business_ids):
+            assert b == TINY_IDS[i]
+            np.testing.assert_allclose(scores[i], model.matrix[model.index[b]] @ taste, rtol=1e-6)
+        assert int(np.argmax(scores)) == TINY_IDS.index("r3")
