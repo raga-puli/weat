@@ -546,3 +546,173 @@ def test_overlap_counts_any_chain_location_in_trimmed_lists():
     assert page.overlap_count(a, b) == 2  # A (id0) and Chain (via id9)
     points = {p["name"]: p["list"] for p in page.map_points([{"restaurants": a}, {"restaurants": b}])}
     assert points == {"A": "both", "Chain": "both", "B": "A", "X": "B"}
+
+
+# --- DATA_SOURCE=db: getters built from database tables (no Postgres needed) -------------
+
+from src import deploy_load  # noqa: E402
+
+RAW = np.random.default_rng(1).normal(size=(8, 6)).astype(np.float32)
+RAW /= np.linalg.norm(RAW, axis=1, keepdims=True)
+DB_RESTAURANTS = pd.DataFrame({
+    "business_id": IDS,
+    "name": FAKE_RESTAURANTS["name"].tolist(),
+    "latitude": FAKE_RESTAURANTS["latitude"].tolist(),
+    "longitude": FAKE_RESTAURANTS["longitude"].tolist(),
+    "price_level": [1, 2, None, 3, 1, 2, 4, None],
+    "categories": [["Pizza"]] * 8,
+    "is_open": FAKE_RESTAURANTS["is_open"].tolist(),
+    "embedding": list(RAW),
+})
+
+
+def _served_model():
+    """The model files mode would serve: debiased, fitted on the fake train."""
+    model = ContentBasedDebiased(matrix=RAW, business_ids=IDS)
+    model.fit(FAKE_TRAIN)
+    return model
+
+
+def _db_tables_for(model, users=("u1", "u2", "u3", "u4")):
+    sample = FAKE_GROUPS.assign(cohesion=[0.9, 0.1], cohesion_bucket=["high", "low"])
+    tables = deploy_load.build_tables(model, FAKE_REVIEWS, list(users), sample)
+    tables["restaurants"] = DB_RESTAURANTS
+    # what the DB returns: vectors and arrays as plain lists
+    tables["user_taste"] = tables["user_taste"].assign(embedding=tables["user_taste"]["embedding"].map(list))
+    tables["model_arrays"] = tables["model_arrays"].assign(vals=tables["model_arrays"]["vals"].map(list))
+    return tables
+
+
+@pytest.fixture
+def db_mode(monkeypatch):
+    model = _served_model()
+    tables = _db_tables_for(model)
+    monkeypatch.setenv("DATA_SOURCE", "db")
+    monkeypatch.setattr(rg, "_db_tables", lambda: tables)
+    getters = (rg.get_recommender, rg.get_restaurants, rg.get_user_reviews, rg.get_val_users, rg.get_val_groups)
+    for g in getters:
+        g.cache_clear()
+    app.dependency_overrides = {}
+    yield model, tables
+    for g in getters:
+        g.cache_clear()
+
+
+def _files_client(model):
+    app.dependency_overrides = {
+        rg.get_recommender: lambda: model,
+        rg.get_restaurants: lambda: FAKE_RESTAURANTS.assign(categories="Pizza"),
+        rg.get_user_reviews: lambda: FAKE_REVIEWS,
+        rg.get_val_users: lambda: ("u1", "u2", "u3", "u4"),
+        rg.get_val_groups: lambda: FAKE_GROUPS.assign(cohesion_bucket=["high", "low"]),
+    }
+    return TestClient(app)
+
+
+def test_data_source_env(monkeypatch):
+    monkeypatch.delenv("DATA_SOURCE", raising=False)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
+    assert rg.data_source() == "files"
+    monkeypatch.setenv("DATA_SOURCE", "DB")
+    assert rg.data_source() == "db"
+    monkeypatch.setenv("DATA_SOURCE", "s3")
+    with pytest.raises(RuntimeError, match="files.*db"):
+        rg.data_source()
+
+
+def test_db_getters_rebuild_the_served_state(db_mode):
+    model, tables = db_mode
+    served = rg.get_recommender()
+    assert served is not model and type(served) is type(model)
+    np.testing.assert_array_equal(served.matrix, model.matrix)  # same centering of the same raw vectors
+    np.testing.assert_array_equal(served.hub, model.hub)
+    assert list(served.taste) == list(model.taste)
+    for u in model.taste:
+        np.testing.assert_array_equal(served.taste[u], model.taste[u])
+    r = rg.get_restaurants()
+    assert r.loc["b3", "is_open"] == False and pd.isna(r.loc["b2", "price_level"])  # noqa: E712
+    assert r.loc["b0", "categories"] == "Pizza"
+    assert rg.get_val_users() == ("u1", "u2", "u3", "u4")
+    reviews = rg.get_user_reviews()
+    assert set(reviews["u4"]["business_id"]) == {"b5", "b6"}
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/group/recommend", {"members": ["u1", "u3"], "strategy": "average", "k": 4}),
+    ("/group/recommend", {"members": ["u1", "u2", "u4"], "strategy": "fairness_repeated", "k": 3, "tau": 0.3}),
+    ("/group/compare", {"members": ["u2", "u3"], "strategies": ["average", "least_misery"], "k": 3,
+                        "include_closed": True}),
+])
+def test_db_mode_responses_identical_to_files_mode(db_mode, path, body):
+    model, _ = db_mode
+    db_resp = TestClient(app).post(path, json=body).json()
+    files_resp = _files_client(model).post(path, json=body).json()
+    app.dependency_overrides = {}
+    assert db_resp == files_resp
+
+
+def test_db_mode_profiles_and_sample(db_mode):
+    model, _ = db_mode
+    client = TestClient(app)
+    params = [("user_ids", "u2"), ("user_ids", "u4")]
+    db_profiles = client.get("/group/users/profiles", params=params).json()
+    for cohesion in ("high", "low"):
+        db_sample = client.get("/group/users/sample", params={"n": 3, "cohesion": cohesion}).json()
+        assert db_sample["group_id"] == {"high": "g_same", "low": "g_mixed"}[cohesion]  # stored buckets
+    files = _files_client(model)
+    assert db_profiles == files.get("/group/users/profiles", params=params).json()
+    app.dependency_overrides = {}
+    unknown = client.post("/group/recommend", json={"members": ["u1", "not_a_demo_user"]})
+    assert unknown.status_code == 422 and "not_a_demo_user" in unknown.json()["detail"]
+
+
+def test_model_from_tables_rejects_missing_hub(db_mode):
+    _, tables = db_mode
+    with pytest.raises(RuntimeError, match="no hub"):
+        rg.model_from_tables({**tables, "model_arrays": tables["model_arrays"].iloc[0:0]})
+
+
+def test_select_demo_balances_cohesion_and_respects_size():
+    model = _served_model()
+    groups = pd.DataFrame({
+        "group_id": [f"g{i}" for i in range(6)],
+        "members": [["u1", "u2"], ["u3", "u4"], ["u1", "u3"], ["u2", "u4"], ["u1", "u4"], ["u2", "u3"]],
+    })
+    users, sample = deploy_load.select_demo(model, groups, ("u1", "u2", "u3", "u4"), n_users=4, n_groups=4)
+    assert len(users) == len(set(users)) <= 4
+    assert set(sample["cohesion_bucket"]) <= {"high", "low"}
+    assert all(set(m) <= set(users) for m in sample["members"])  # sample groups use demo users only
+    counts = sample["cohesion_bucket"].value_counts()
+    assert abs(counts.get("high", 0) - counts.get("low", 0)) <= 1
+    again, sample2 = deploy_load.select_demo(model, groups, ("u1", "u2", "u3", "u4"), n_users=4, n_groups=4)
+    assert again == users and sample2.equals(sample)  # seeded
+
+
+def test_build_tables_contents_and_no_text():
+    model = _served_model()
+    tables = deploy_load.build_tables(model, FAKE_REVIEWS, ["u2", "u4"], FAKE_GROUPS.iloc[:0].assign(
+        cohesion=[], cohesion_bucket=[]))
+    assert set(tables) == set(deploy_load.GROUP_TABLES)
+    p = tables["user_profiles"]
+    assert p[p.user_id == "u4"][["rank", "business_id", "stars"]].values.tolist() == [[1, "b5", 5.0], [2, "b6", 3.0]]
+    assert sorted(tables["user_visited"].itertuples(index=False, name=None)) == [
+        ("u2", "b1"), ("u2", "b2"), ("u4", "b5"), ("u4", "b6")]
+    hub = tables["model_arrays"].iloc[0]
+    assert (hub["name"], hub["model"], hub["n"]) == ("hub", "content_debiased", 8)
+    np.testing.assert_array_equal(hub["vals"], model.hub)
+    columns = {c for t in tables.values() for c in t.columns}
+    assert not columns & {"text", "review_text", "review_id"}
+
+
+def test_db_mode_accepts_pgvector_vector_objects(db_mode):
+    from pgvector import Vector
+
+    model, tables = db_mode
+    as_vectors = {**tables,
+                  "restaurants": tables["restaurants"].assign(embedding=[Vector(v) for v in RAW]),
+                  "user_taste": tables["user_taste"].assign(
+                      embedding=[Vector(list(v)) for v in tables["user_taste"]["embedding"]])}
+    rebuilt = rg.model_from_tables(as_vectors)
+    np.testing.assert_array_equal(rebuilt.matrix, model.matrix)
+    for u in model.taste:
+        np.testing.assert_array_equal(rebuilt.taste[u], model.taste[u])
