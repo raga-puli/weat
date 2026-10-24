@@ -54,6 +54,8 @@ PROMPT_VERSION = "v1"
 # parse_with_engine (the API path) gives the LLM one attempt of at most LLM_TIMEOUT_S, below the UI's
 # 30 s request timeout, then falls back to the rules. parse() / --eval have no timeout.
 LLM_TIMEOUT_S = 20.0
+# Connecting to Ollama gets only this long, so a missing/unreachable Ollama falls back to the rules fast.
+LLM_CONNECT_TIMEOUT_S = 2.0
 # How long Ollama keeps the model in memory after a call; reloading a 7B model takes over a minute.
 LLM_KEEP_ALIVE = "30m"
 CACHE_DIR = Path("data/cache/llm")
@@ -235,11 +237,14 @@ def _model() -> str:
 
 
 def _client(timeout: float | None = None):
+    """An Ollama client whose connect attempt is capped at LLM_CONNECT_TIMEOUT_S; `timeout` bounds the
+    rest of the request (None: unbounded)."""
+    import httpx
     import ollama
     from dotenv import load_dotenv
 
     load_dotenv()
-    return ollama.Client(host=os.getenv("OLLAMA_HOST"), timeout=timeout)
+    return ollama.Client(host=os.getenv("OLLAMA_HOST"), timeout=httpx.Timeout(timeout, connect=LLM_CONNECT_TIMEOUT_S))
 
 
 def _cache_path(model: str, text: str) -> Path:
@@ -296,6 +301,19 @@ def _parse_llm(text: str, client=None, model: str | None = None, attempts: int =
 # ---------- rules engine ----------
 
 ENGINES = ("rules", "llm")
+DEFAULT_ENGINE = "llm"  # when DEFAULT_ENGINE is unset or invalid in .env
+
+
+def default_engine() -> str:
+    """DEFAULT_ENGINE from the environment (.env), read on every call; "llm" if unset or invalid."""
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    engine = os.getenv("DEFAULT_ENGINE", DEFAULT_ENGINE).strip().lower()
+    if engine not in ENGINES:
+        log.warning("DEFAULT_ENGINE=%r is not one of %s; using %r", engine, ENGINES, DEFAULT_ENGINE)
+        return DEFAULT_ENGINE
+    return engine
 
 # Longest first, so "penn campus" wins over "penn".
 ANCHOR_ALIASES = {
@@ -438,11 +456,14 @@ def clean_soft(parsed: ParsedQuery) -> ParsedQuery:
 
 
 def parse_with_engine(
-    text: str, engine: str = "llm", client=None, model: str | None = None
+    text: str, engine: str | None = None, client=None, model: str | None = None
 ) -> tuple[ParsedQuery, str]:
-    """(parsed, engine_used). "llm" makes one attempt (LLM_TIMEOUT_S when no client is given) and
-    falls back to the rules when Ollama is unreachable, misconfigured, too slow, or returns invalid
-    output, so engine_used can differ from engine."""
+    """(parsed, engine_used). engine None means default_engine(). "llm" makes one attempt
+    (LLM_CONNECT_TIMEOUT_S to connect, LLM_TIMEOUT_S overall, when no client is given) and falls back
+    to the rules when Ollama is unreachable, misconfigured, too slow, or returns invalid output, so
+    engine_used can differ from engine."""
+    if engine is None:
+        engine = default_engine()
     if engine not in ENGINES:
         raise ValueError(f"engine must be one of {ENGINES}, got {engine!r}")
     if engine == "llm":

@@ -58,6 +58,12 @@ def db_down():
     raise psycopg.OperationalError("connection refused")
 
 
+@pytest.fixture(autouse=True)
+def default_engine_llm(monkeypatch):
+    """Requests without `engine` use DEFAULT_ENGINE; pin it so the developer's .env doesn't matter."""
+    monkeypatch.setenv("DEFAULT_ENGINE", "llm")
+
+
 @pytest.fixture
 def client():
     app.dependency_overrides.update(
@@ -112,6 +118,26 @@ def test_numpy_backend_matches_and_never_touches_the_db(client):
     response = client.post("/search", json={"text": QUERY, "backend": "numpy", "k": 1})
     assert response.status_code == 200
     assert ids(response) == ["cozy"]
+
+
+def test_numpy_backend_without_data_files_is_400(client):
+    def files_missing():
+        raise FileNotFoundError(2, "No such file or directory", "data/processed/restaurants.parquet")
+
+    app.dependency_overrides[rs.search_data_provider] = lambda: files_missing
+    response = client.post("/search", json={"text": QUERY, "backend": "numpy"})
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "data/processed/restaurants.parquet" in detail and "backend=sql" in detail
+
+
+@pytest.mark.parametrize("default", ["rules", "llm"])
+def test_engine_defaults_to_DEFAULT_ENGINE(sql_on_numpy, monkeypatch, default):
+    monkeypatch.setenv("DEFAULT_ENGINE", default)
+    assert sql_on_numpy.post("/search", json={"text": QUERY}).json()["engine_used"] == default
+    assert sql_on_numpy.post("/search/parse", json={"text": QUERY}).json()["engine_used"] == default
+    # an explicit engine still wins
+    assert sql_on_numpy.post("/search", json={"text": QUERY, "engine": "llm"}).json()["engine_used"] == "llm"
 
 
 def test_include_closed(sql_on_numpy):
