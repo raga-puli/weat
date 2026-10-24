@@ -4,14 +4,15 @@
     POST /search/parse    text -> ParsedQuery only (for debugging the UI)
     GET  /search/anchors  the named places `near` can refer to
 
-engine="llm" falls back to the rules parser when Ollama is down or its output is invalid; engine_used
-says which one actually ran. A request may carry `parsed` (a corrected ParsedQuery from the UI's
+A request without `engine` uses DEFAULT_ENGINE from .env (llm | rules; read per request).
+engine="llm" falls back to the rules parser when Ollama is down (2 s connect timeout) or its output is
+invalid; engine_used says which one actually ran. A request may carry `parsed` (a corrected ParsedQuery from the UI's
 "Edit filters"); parsing is then skipped and engine_used is "manual". Closed restaurants are excluded unless include_closed=true.
 
 Heavy resources come from lru_cache getters (get_db_conn, get_encoder, get_search_data) behind
 dependencies, so tests can swap them with app.dependency_overrides. The DB connection and the parquet
 frame are handed out as zero-argument providers so backend=numpy never connects to Postgres and
-backend=sql never reads the parquet. At server start (the router's lifespan, merged into the app by
+backend=sql never reads the parquet; backend=numpy without the data files is a 400. At server start (the router's lifespan, merged into the app by
 include_router) the encoder and DB connection are warmed and Ollama starts loading its model, so the
 first search doesn't pay ~50 s of torch import; TestClient without `with` skips this.
 """
@@ -31,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from src import search
-from src.query_parser import ANCHORS, ParsedQuery, parse_with_engine, preload_llm
+from src.query_parser import ANCHORS, ParsedQuery, default_engine, parse_with_engine, preload_llm
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ router = APIRouter(prefix="/search", tags=["search"], lifespan=_lifespan)
 
 DB_CONNECT_TIMEOUT_S = 5
 DB_UNAVAILABLE = "Database unavailable. Start Postgres with `docker compose up -d`, or retry with backend=numpy."
+NUMPY_DATA_MISSING = (
+    "backend=numpy needs the local data files, and {path} is missing. Build them with the pipeline "
+    "(python -m src.prep, then python -m src.embed), or use backend=sql."
+)
 
 
 # ---------- dependencies ----------
@@ -104,7 +109,7 @@ class ParseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: QueryText
-    engine: Engine = "llm"
+    engine: Engine = Field(default_factory=default_engine)
 
 
 class ParsedQueryIn(BaseModel):
@@ -209,7 +214,12 @@ def search_restaurants(
             get_db_conn.cache_clear()
             raise HTTPException(status_code=503, detail=DB_UNAVAILABLE) from err
     else:
-        rows = search.search_numpy(parsed, data=data(), **options)
+        try:
+            frame = data()
+        except FileNotFoundError as err:  # restaurants.parquet, embeddings.npy or business_ids.txt
+            log.warning("search: numpy data files missing: %s", err)
+            raise HTTPException(status_code=400, detail=NUMPY_DATA_MISSING.format(path=err.filename or err)) from err
+        rows = search.search_numpy(parsed, data=frame, **options)
     search_ms = _ms(search_start)
 
     return SearchResponse(

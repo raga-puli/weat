@@ -252,6 +252,51 @@ def test_parse_with_engine_bounds_the_llm_call_and_falls_back_on_timeout(monkeyp
     assert (parsed, engine_used) == (ParsedQuery(near="Drexel", dietary=["vegan"]), "rules")
 
 
+@pytest.mark.parametrize("timeout", [qp.LLM_TIMEOUT_S, None])
+def test_client_caps_the_connect_timeout_at_two_seconds(timeout):
+    http = qp._client(timeout=timeout)._client  # the underlying httpx.Client
+    assert http.timeout.connect == qp.LLM_CONNECT_TIMEOUT_S == 2.0
+    assert http.timeout.read == timeout
+
+
+def test_unreachable_ollama_falls_back_to_rules_within_the_connect_timeout(monkeypatch):
+    import time
+
+    # 10.255.255.1 is non-routable: the TCP connect hangs until the connect timeout fires
+    monkeypatch.setenv("OLLAMA_HOST", "http://10.255.255.1:11434")
+    start = time.perf_counter()
+    parsed, engine_used = qp.parse_with_engine("vegan near Drexel", "llm", model=MODEL)
+    assert engine_used == "rules" and parsed == ParsedQuery(near="Drexel", dietary=["vegan"])
+    assert time.perf_counter() - start < qp.LLM_CONNECT_TIMEOUT_S + 3
+
+
+@pytest.fixture
+def no_dotenv(monkeypatch):
+    """default_engine() reads .env; keep the developer's .env out of these tests."""
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: None)
+
+
+@pytest.mark.parametrize(
+    "value, expected", [("rules", "rules"), ("llm", "llm"), (" RULES ", "rules"), ("gpt", "llm"), (None, "llm")]
+)
+def test_default_engine_reads_the_environment(no_dotenv, monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("DEFAULT_ENGINE", raising=False)
+    else:
+        monkeypatch.setenv("DEFAULT_ENGINE", value)
+    assert qp.default_engine() == expected
+
+
+def test_parse_with_engine_none_uses_default_engine(no_dotenv, monkeypatch):
+    monkeypatch.setenv("DEFAULT_ENGINE", "rules")
+    client = FakeClient(json.dumps(VALID))
+    assert qp.parse_with_engine("vegan near Drexel", client=client, model=MODEL) == (
+        ParsedQuery(near="Drexel", dietary=["vegan"]), "rules")
+    assert client.calls == []
+
+
 def test_parse_with_engine_falls_back_to_rules_when_ollama_is_unreachable():
     class DownClient:
         def chat(self, **kwargs):
