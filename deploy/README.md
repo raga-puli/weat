@@ -41,7 +41,7 @@ Re-running `deploy_load` replaces the restaurants and group tables. Only the 500
 
 ## (b) The API on a Render free web service
 
-The image is built from the repo's `Dockerfile` (Person B's), running `uvicorn src.api.main:app`. **No torch in the API image:** the search encoder runs MiniLM via onnxruntime (pending the joint scaffolding PR adding `requirements-api.txt`). The API image must not include sentence-transformers or torch: with them it won't fit in the free instance's 512 MB. Until that PR merges, the current `Dockerfile` still installs both, so don't deploy it to the free instance yet.
+The image is built from the repo's `Dockerfile` (Person B's), running `uvicorn src.api.main:app`. **No torch in the API image:** the image installs `requirements-api.txt`, and the search encoder runs MiniLM via onnxruntime (`ENCODER=onnx` is set in the image, which downloads its own pinned model files). The API image must not include sentence-transformers or torch: with them it won't fit in the free instance's 512 MB. The group API needs neither (its endpoints run with both blocked).
 
 1. In the Render dashboard, create a new **Web Service** from this GitHub repository, branch `main`, runtime **Docker**, instance type **Free** **(verify on the provider's site)**.
 2. Port: Render routes to the port the service listens on and provides a `PORT` environment variable. Set the start command (Docker command override) to `uvicorn src.api.main:app --host 0.0.0.0 --port $PORT`, or confirm Render detects port 8000 **(verify on the provider's site)**.
@@ -58,7 +58,7 @@ The image is built from the repo's `Dockerfile` (Person B's), running `uvicorn s
 
 - Render spins the free service down after 15 minutes without traffic; the next request wakes it, which takes about a minute.
 - Neon suspends idle compute after 5 minutes; the first query afterwards also waits for it to resume.
-- The UI shows a wake-up message and retries while the API is waking (pending the `ui_common` change, a frozen shared file). Until then, the first page load after an idle period may show "API offline"; reload after a minute.
+- The UI waits it out: `src/ui_common.py` shows "Waking up the server, about a minute…" and retries for up to 90 s, and retries 503s that carry `Retry-After` (e.g. search while the encoder warms up).
 
 ## (c) The UI on Streamlit Community Cloud
 
@@ -71,13 +71,13 @@ The image is built from the repo's `Dockerfile` (Person B's), running `uvicorn s
    `src/ui_common.py` reads `API_URL` from the environment; Streamlit Community Cloud exposes root-level secrets as environment variables **(verify on the provider's site)**.
 4. Deploy. The landing page shows a green "API online" badge when it can reach the API.
 5. Dependencies: Streamlit Community Cloud installs `requirements.txt`, which includes torch and sentence-transformers even though the UI only calls the API. If the build exceeds its size or memory limits **(verify on the provider's site)**, a UI-only requirements file is a change to frozen files (requirements) that both people need to agree on.
-6. The landing page's badge shows "API offline" while Render wakes the API (about a minute after an idle period); see "Cold starts" above.
+6. After an idle period the first page load shows the wake-up message for about a minute; see "Cold starts" above.
 
 ## Checklist
 
 - [ ] Neon project created, `vector` extension available
 - [ ] `src.deploy_load` printed the expected row counts
-- [ ] API image has no torch or sentence-transformers (after the `requirements-api.txt` scaffolding PR)
+- [ ] API image built from `requirements-api.txt` (no torch or sentence-transformers)
 - [ ] API deployed on Render (Free) with `DATABASE_URL`, `DATA_SOURCE=db`, `DEFAULT_ENGINE=rules` as secrets; `/health` OK
 - [ ] UI deployed with `API_URL` as a secret; the badge shows "API online"
 - [ ] No connection strings or data files committed (`git status`, `git log -p`)
