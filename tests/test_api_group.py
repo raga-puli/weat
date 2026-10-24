@@ -290,7 +290,7 @@ def test_display_rows_formatting_and_overlap():
     labels = page.member_labels(["u1", "u2"])
     assert labels == {"u1": "M1", "u2": "M2"}
     rows = page.display_rows(result, other_ids={"d"}, labels=labels)
-    assert rows[0] == {"rank": 1, "name": "Taco Place", "categories": "Mexican", "price": "$$$",
+    assert rows[0] == {"rank": 1, "api_rank": 1, "name": "Taco Place", "categories": "Mexican", "price": "$$$",
                        "score": 0.912, "M1": 0.95, "M2": 0.871, "in_both": False}
     assert rows[1]["name"] == "QDOBA (2 locations)" and rows[1]["price"] == "–"
     assert rows[1]["in_both"]  # its second location is in the other list
@@ -339,3 +339,210 @@ def test_short_categories():
     assert page.short_categories("Restaurants, Mexican, Food, Tacos") == "Mexican, Tacos"
     assert page.short_categories("A, B, C, D, Restaurants") == "A, B, C, …"
     assert page.short_categories(None) == "" and page.short_categories("") == ""
+
+
+def test_cohesion_reading_uses_val_terciles():
+    assert (page.COHESION_LOW, page.COHESION_HIGH) == (0.18, 0.32)
+    assert page.cohesion_reading(0.05).startswith("Very different tastes")
+    assert page.cohesion_reading(0.18).startswith("Partly overlapping")
+    assert page.cohesion_reading(0.319).startswith("Partly overlapping")
+    assert page.cohesion_reading(0.32).startswith("Similar tastes")
+
+
+def test_metric_deltas_b_minus_a():
+    a = {"group_utility_predicted": 0.86, "worst_member_predicted": 0.76, "fairness_gap_predicted": 0.18}
+    b = {"group_utility_predicted": 0.84, "worst_member_predicted": 0.80, "fairness_gap_predicted": 0.09}
+    d = page.metric_deltas(a, b)
+    assert d == pytest.approx({"group_utility_predicted": -0.02, "worst_member_predicted": 0.04,
+                               "fairness_gap_predicted": -0.09})
+
+
+def test_top_member_rows_collapses_and_prefixes_rank():
+    result = {"restaurants": [
+        _r("a", "Taco Place", 0.9, {"u1": 0.9, "u2": 0.7}),
+        _r("b", "QDOBA", 0.8, {"u1": 0.8, "u2": 0.6}),
+        _r("c", "QDOBA", 0.7, {"u1": 0.1, "u2": 0.1}),
+        *[_r(f"x{i}", f"Place {i}", 0.5, {"u1": 0.5, "u2": 0.5}) for i in range(5)],
+    ]}
+    rows = page.top_member_rows(result, page.member_labels(["u1", "u2"]))
+    assert len(rows) == 5
+    assert rows[0] == {"restaurant": "1. Taco Place", "M1": 0.9, "M2": 0.7}
+    assert rows[1]["restaurant"] == "2. QDOBA (2 locations)" and rows[1]["M1"] == 0.8  # best location's scores
+    assert rows[2]["restaurant"] == "4. Place 0"
+
+
+def test_map_points_marks_list_membership_and_skips_missing_coords():
+    def loc(bid, lat=39.95, lon=-75.16):
+        return {"business_id": bid, "name": bid, "lat": lat, "lon": lon}
+
+    a = {"restaurants": [loc("a"), loc("both"), loc("nocoords", lat=None)]}
+    b = {"restaurants": [loc("both"), loc("b")]}
+    points = {p["name"]: p for p in page.map_points([a, b])}
+    assert set(points) == {"a", "both", "b"}
+    assert {n: p["list"] for n, p in points.items()} == {"a": "A", "both": "both", "b": "B"}
+    assert points["both"]["color"] == page.MAP_COLORS["both"]
+    assert {p["list"] for p in page.map_points([a])} == {"A"}
+
+
+def test_member_score_bounds():
+    res = {"restaurants": [{"member_scores": {"u1": -1.2, "u2": 0.4}}, {"member_scores": {"u1": 2.5}}]}
+    assert page.member_score_bounds([res], "rank") == (0.0, 1.0)
+    assert page.member_score_bounds([res], "zscore") == (-1.2, 2.5)
+
+
+@pytest.mark.parametrize("tau", [0.1, 3.0])
+def test_tau_reaches_fairness_repeated(client, tau):
+    from src.aggregate import fairness_repeated
+
+    body = _post(client, "/group/recommend", strategy="fairness_repeated", k=4, tau=tau,
+                 include_closed=True, exclude_visited=False).json()
+    assert body["params"]["tau"] == tau
+    scores = np.stack([FAKE_MODEL.scores_for(FAKE_MODEL.taste[u]) for u in ["u1", "u3"]])
+    _, _, weights = fairness_repeated(scores, np.zeros(8, dtype=bool), 4, tau=tau, return_weights=True)
+    got = [[h["member_weights"][u] for u in ["u1", "u3"]] for h in body["history"]]
+    np.testing.assert_allclose(got, weights, atol=1e-9)
+
+
+def test_tau_default_and_validation(client):
+    from src.aggregate import TAU
+
+    body = _post(client, "/group/recommend", strategy="fairness_repeated", k=3).json()
+    assert body["params"]["tau"] == TAU == 0.1
+    assert _post(client, "/group/recommend", strategy="fairness_repeated", tau=0).status_code == 422
+
+
+def test_member_colors_distinct_and_ordered():
+    labels = page.member_labels([f"u{i}" for i in range(6)])
+    colors = page.member_colors(labels)
+    assert list(colors) == ["M1", "M2", "M3", "M4", "M5", "M6"]
+    assert len(set(colors.values())) == 6
+    assert colors["M1"] == page.MEMBER_PALETTE[0]
+    assert page.hex_to_rgba("#0072B2") == [0, 114, 178, 220]
+
+
+def test_member_bars_svg_heights_colors_and_labels():
+    import base64
+
+    uri = page.member_bars_svg([0.0, 0.5, 1.0], ["#111111", "#222222", "#333333"], height=41)
+    assert uri.startswith("data:image/svg+xml;base64,")
+    svg = base64.b64decode(uri.split(",", 1)[1]).decode()
+    assert svg.count("<rect") == 3 and svg.count("<text") == 3
+    for color in ("#111111", "#222222", "#333333"):
+        assert f'fill="{color}"' in svg
+    assert ">0.00<" in svg and ">0.50<" in svg and ">1.00<" in svg
+    # honest fixed axis: bar height is proportional to the value (41 px minus an 11 px label band)
+    assert 'height="0.0"' in svg and 'height="15.0"' in svg and 'height="30.0"' in svg
+    # values outside the axis are clipped, not rescaled
+    clipped = base64.b64decode(page.member_bars_svg([1.7], ["#000000"], height=41).split(",", 1)[1]).decode()
+    assert 'height="30.0"' in clipped and ">1.70<" in clipped
+
+
+def test_tau_ui_options():
+    assert page.TAU_UI_DEFAULT == 0.3 and page.TAU_UI_DEFAULT in page.TAU_OPTIONS
+    assert page.TAU_OPTIONS[0] == 0.05 and page.TAU_OPTIONS[-1] == 3.0
+    assert page.TAU_OPTIONS == sorted(page.TAU_OPTIONS) and 0.1 in page.TAU_OPTIONS
+
+
+def test_map_points_ranks_and_tooltips():
+    def loc(bid):
+        return {"business_id": bid, "name": f"N-{bid}", "lat": 39.95, "lon": -75.16}
+
+    a = {"restaurants": [loc("a"), loc("both")]}
+    b = {"restaurants": [loc("x"), loc("y"), loc("both")]}
+    points = {p["name"]: p for p in page.map_points([a, b])}
+    assert points["N-both"]["tooltip"] == "N-both (A #2 · B #3)"
+    assert points["N-a"]["tooltip"] == "N-a (A #1)" and points["N-y"]["tooltip"] == "N-y (B #2)"
+    assert points["N-both"]["rgba"] == page.hex_to_rgba(page.MAP_COLORS["both"])
+    single = page.map_points([a])
+    assert [p["tooltip"] for p in single] == ["N-a (#1)", "N-both (#2)"]
+
+
+def test_fit_view_contains_points_and_zooms_out_for_spread():
+    tight = [{"lat": 39.95, "lon": -75.17}, {"lat": 39.96, "lon": -75.16}]
+    wide = [{"lat": 39.90, "lon": -75.25}, {"lat": 40.05, "lon": -75.05}]
+    vt, vw = page.fit_view(tight), page.fit_view(wide)
+    assert vw["zoom"] < vt["zoom"]
+    assert 39.90 <= vw["latitude"] <= 40.05 and -75.25 <= vw["longitude"] <= -75.05
+    assert page.fit_view([{"lat": 39.95, "lon": -75.16}])["zoom"] == 15.0  # single point: capped
+    assert page.fit_view([])["zoom"] == 11.0
+    # the padded extent fits the map at deck.gl's 512-px zoom convention (wide case)
+    assert page.TILE_PX == 512
+    lon_px = (0.20 * 1.3) * page.TILE_PX * 2 ** vw["zoom"] / 360
+    assert lon_px <= 1000 + 1
+
+
+def _api_result(names, members=("u1", "u2"), history=False):
+    """An API-shaped result whose member scores encode position: u1 = 1 - i/10, u2 = i/10."""
+    restaurants = [
+        {"business_id": f"id{i}", "name": n, "score": 0.0, "price_level": 1, "categories": "Food",
+         "lat": 39.9 + i / 100, "lon": -75.1, "member_scores": {"u1": 1 - i / 10, "u2": i / 10}}
+        for i, n in enumerate(names)
+    ]
+    result = {"strategy": "average", "members": list(members), "restaurants": restaurants,
+              "summary": {"note": "PREDICTED", "group_utility_predicted": -1.0,
+                          "worst_member_predicted": -1.0, "fairness_gap_predicted": -1.0}}
+    if history:
+        result["history"] = [{"dinner": i + 1, "business_id": f"id{i}", "member_scores": {"u1": 0.5, "u2": 0.5},
+                              "member_weights": {"u1": 0.5, "u2": 0.5}} for i in range(len(names))]
+    return result
+
+
+def test_trim_result_keeps_k_distinct_names_and_renumbers():
+    # API order: A, Chain, B, Chain, Chain, C, D  -> distinct: A, Chain(3), B, C, D
+    res = page.trim_result(_api_result(["A", "Chain", "B", "Chain", "Chain", "C", "D"]), k=4)
+    rows = res["restaurants"]
+    assert [r["display_name"] for r in rows] == ["A", "Chain (3 locations)", "B", "C"]
+    assert [r["rank"] for r in rows] == [1, 2, 3, 4]
+    assert [r["api_rank"] for r in rows] == [1, 2, 3, 6]
+    assert rows[1]["business_ids"] == ["id1", "id3", "id4"] and rows[1]["business_id"] == "id1"
+    assert res["api_k"] == 7
+    # summary recomputed over the kept rows (best locations id0, id1, id2, id5), as the API does
+    u1 = (1.0 + 0.9 + 0.8 + 0.5) / 4
+    u2 = (0.0 + 0.1 + 0.2 + 0.5) / 4
+    s = res["summary"]
+    assert s["group_utility_predicted"] == pytest.approx((u1 + u2) / 2)
+    assert s["worst_member_predicted"] == pytest.approx(min(u1, u2))
+    assert s["fairness_gap_predicted"] == pytest.approx(abs(u1 - u2))
+    assert s["note"] == "PREDICTED"
+    # display: collapse again is a no-op that keeps chain counts and new ranks
+    shown = page.display_rows(res, set(), page.member_labels(["u1", "u2"]))
+    assert [(r["rank"], r["api_rank"], r["name"]) for r in shown][:2] == [(1, 1, "A"), (2, 2, "Chain (3 locations)")]
+
+
+def test_trim_result_fairness_repeated_keeps_the_dinner_sequence():
+    raw = _api_result(["A", "Chain", "B", "Chain", "C", "D", "E"], history=True)
+    raw["strategy"] = "fairness_repeated"
+    res = page.trim_result(raw, k=5)
+    rows = res["restaurants"]
+    # first k dinners, in order, nothing collapsed or renumbered; repeat chain location labelled
+    assert [r["business_id"] for r in rows] == ["id0", "id1", "id2", "id3", "id4"]
+    assert [r["rank"] for r in rows] == [1, 2, 3, 4, 5]
+    assert [r["display_name"] for r in rows] == ["A", "Chain", "B", "Chain (another location)", "C"]
+    assert [h["dinner"] for h in res["history"]] == [1, 2, 3, 4, 5]
+    # summary over those k dinners
+    u1 = sum(1 - i / 10 for i in range(5)) / 5
+    u2 = sum(i / 10 for i in range(5)) / 5
+    assert res["summary"]["group_utility_predicted"] == pytest.approx((u1 + u2) / 2)
+    # display and per-dinner view keep the sequence and the label
+    labels = page.member_labels(["u1", "u2"])
+    shown = page.display_rows(res, set(), labels)
+    assert [r["name"] for r in shown] == ["A", "Chain", "B", "Chain (another location)", "C"]
+    assert [r["pick"] for r in page.dinner_rows(res, labels)][3] == "Chain (another location)"
+    assert [r["restaurant"] for r in page.top_member_rows(res, labels)][3] == "4. Chain (another location)"
+
+
+def test_trim_result_when_fewer_distinct_than_k():
+    res = page.trim_result(_api_result(["A", "A", "B"]), k=10)
+    assert [r["display_name"] for r in res["restaurants"]] == ["A (2 locations)", "B"]
+
+
+def test_overlap_counts_any_chain_location_in_trimmed_lists():
+    a = page.trim_result(_api_result(["A", "Chain", "B"]), k=3)["restaurants"]
+    b_raw = _api_result(["X", "Chain", "A"])
+    for r, bid in zip(b_raw["restaurants"], ["x", "id9", "id0"]):  # B kept a different Chain location
+        r["business_id"] = bid
+    b = page.trim_result(b_raw, k=3)["restaurants"]
+    a[1]["business_ids"].append("id9")  # A's Chain row also covers location id9
+    assert page.overlap_count(a, b) == 2  # A (id0) and Chain (via id9)
+    points = {p["name"]: p["list"] for p in page.map_points([{"restaurants": a}, {"restaurants": b}])}
+    assert points == {"A": "both", "Chain": "both", "B": "A", "X": "B"}

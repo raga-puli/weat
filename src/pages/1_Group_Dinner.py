@@ -4,8 +4,8 @@ All data comes from the API through src/ui_common.py; this page never imports
 model code. The pure helpers below are tested in tests/test_api_group.py; the
 Streamlit UI runs only when Streamlit executes the page (__name__ == "__main__").
 
-Deep link: ?cohesion=low&seed=42&n=4 draws a sample group and runs the
-comparison on load (used for screenshots and sharing).
+Deep link: ?cohesion=low&seed=42&n=4 draws a sample group on load; optional
+&strategy=...&strategy_b=... set the strategies and &compare=0 selects single mode.
 """
 
 import json
@@ -59,12 +59,14 @@ def collapse_chains(restaurants: list[dict]) -> list[dict]:
     out, by_name = [], {}
     for rank, r in enumerate(restaurants, 1):
         name = r.get("name") or r["business_id"]
+        ids = list(r.get("business_ids", [r["business_id"]]))  # already-collapsed rows keep theirs
         if name in by_name:
             row = by_name[name]
-            row["locations"] += 1
-            row["business_ids"].append(r["business_id"])
+            row["locations"] += r.get("locations", 1)
+            row["business_ids"].extend(ids)
             continue
-        row = {**r, "rank": rank, "name": name, "locations": 1, "business_ids": [r["business_id"]]}
+        row = {**r, "rank": r.get("rank", rank), "name": name,
+               "locations": r.get("locations", 1), "business_ids": ids}
         by_name[name] = row
         out.append(row)
     for row in out:
@@ -80,9 +82,10 @@ def display_rows(result: dict, other_ids: set[str], labels: dict[str, str]) -> l
     one column per member (by label), and whether it is also in the other list
     (any of a collapsed row's locations counts)."""
     rows = []
-    for r in collapse_chains(result["restaurants"]):
+    for r in list_rows(result):
         row = {
             "rank": r["rank"],
+            "api_rank": r.get("api_rank", r["rank"]),
             "name": r["display_name"],
             "categories": short_categories(r.get("categories")),
             "price": format_price(r.get("price_level")),
@@ -98,7 +101,8 @@ def display_rows(result: dict, other_ids: set[str], labels: dict[str, str]) -> l
 def dinner_rows(result: dict, labels: dict[str, str]) -> list[dict]:
     """fairness_repeated per-dinner view: the pick, then each member's score
     and weight for that dinner."""
-    names = {r["business_id"]: r.get("name") or r["business_id"] for r in result["restaurants"]}
+    names = {r["business_id"]: r.get("display_name") or r.get("name") or r["business_id"]
+             for r in list_rows(result)}
     rows = []
     for h in result.get("history", []):
         row = {"dinner": h["dinner"], "pick": names.get(h["business_id"], h["business_id"])}
@@ -107,6 +111,225 @@ def dinner_rows(result: dict, labels: dict[str, str]) -> list[dict]:
             row[f"{label} weight"] = round(float(h["member_weights"][member]), 3)
         rows.append(row)
     return rows
+
+
+EXTRA_FETCH = 5  # ask the API for k + 5 so chain collapsing still leaves k distinct names
+
+
+def sequence_rows(restaurants: list[dict]) -> list[dict]:
+    """fairness_repeated: a dinner sequence, shown as-is (no collapsing or
+    renumbering). A later location of a chain already in the sequence is
+    labelled "(another location)"."""
+    seen, rows = set(), []
+    for i, r in enumerate(restaurants, 1):
+        name = r.get("name") or r["business_id"]
+        rows.append({**r, "rank": i, "api_rank": i, "name": name, "locations": 1,
+                     "business_ids": [r["business_id"]],
+                     "display_name": f"{name} (another location)" if name in seen else name})
+        seen.add(name)
+    return rows
+
+
+def list_rows(result: dict) -> list[dict]:
+    """The rows a list shows: chains collapsed, except fairness_repeated (a sequence)."""
+    if result.get("strategy") == "fairness_repeated":
+        rows = result["restaurants"]
+        return rows if rows and "display_name" in rows[0] else sequence_rows(rows)
+    return collapse_chains(result["restaurants"])
+
+
+def trim_result(result: dict, k: int) -> dict:
+    """The API returned k + EXTRA_FETCH restaurants. Collapse chains, keep the
+    first k distinct names, renumber ranks 1..k (`api_rank` keeps the API's),
+    and recompute the predicted summary over the kept rows exactly as the API
+    does (each member's mean over the list; group = mean, worst = min, gap =
+    max - min), using each kept row's best location.
+
+    fairness_repeated is a dinner sequence, so it is never collapsed or
+    renumbered: the first k dinners are kept as-is (identical to what the
+    algorithm picks for k, since each dinner depends only on earlier ones),
+    with repeat chain locations labelled. Its history keeps those k dinners."""
+    if result.get("strategy") == "fairness_repeated":
+        kept = sequence_rows(result["restaurants"][:k])
+    else:
+        kept = [{**r, "api_rank": r["rank"], "rank": i}
+                for i, r in enumerate(collapse_chains(result["restaurants"])[:k], 1)]
+    members = list(result["members"])
+    means = [sum(float(r["member_scores"][m]) for r in kept) / len(kept) for m in members] if kept else []
+    summary = dict(result["summary"])
+    if means:
+        summary.update({
+            "group_utility_predicted": sum(means) / len(means),
+            "worst_member_predicted": min(means),
+            "fairness_gap_predicted": max(means) - min(means),
+            "member_means_predicted": dict(zip(members, means)),
+        })
+    trimmed = {**result, "restaurants": kept, "summary": summary, "api_k": len(result["restaurants"])}
+    if "history" in result:
+        trimmed["history"] = list(result["history"][:k])  # dinners 1..k, in order
+    return trimmed
+
+
+def overlap_count(rows_a: list[dict], rows_b: list[dict]) -> int:
+    """Rows of list A that also appear in list B, counting any location of a
+    collapsed chain (lists as returned by trim_result)."""
+    ids_b = {b for r in rows_b for b in r.get("business_ids", [r["business_id"]])}
+    return sum(bool(set(r.get("business_ids", [r["business_id"]])) & ids_b) for r in rows_a)
+
+
+# Val-group cohesion terciles under the API's definition (mean pairwise cosine of
+# members' whole-history taste vectors), measured 2026-10-18 over 7,228 val groups:
+# 33rd percentile 0.18, median 0.25, 67th percentile 0.32.
+COHESION_LOW, COHESION_HIGH = 0.18, 0.32
+NORM_HELP = {
+    "rank": "each member's percentile among the candidates (0 = their worst, 1 = their best)",
+    "zscore": "each member's standardized score (mean 0, sd 1 over the candidates)",
+    "raw": "raw similarity scores, not comparable across members",
+}
+
+
+def cohesion_reading(cohesion: float) -> str:
+    """One plain-English line for a group's cohesion score."""
+    if cohesion < COHESION_LOW:
+        return "Very different tastes, so expect compromise picks that no one loves but everyone rates fairly well."
+    if cohesion < COHESION_HIGH:
+        return "Partly overlapping tastes; strategies will agree on some picks and differ on others."
+    return "Similar tastes; most strategies will pick much the same places."
+
+
+def metric_deltas(summary_a: dict, summary_b: dict) -> dict[str, float]:
+    """Strategy B minus strategy A on the three predicted metrics."""
+    keys = ("group_utility_predicted", "worst_member_predicted", "fairness_gap_predicted")
+    return {k: float(summary_b[k]) - float(summary_a[k]) for k in keys}
+
+
+def top_member_rows(result: dict, labels: dict[str, str], top: int = 5) -> list[dict]:
+    """Per-member scores for the first `top` (chain-collapsed) restaurants;
+    restaurant labels are prefixed with their rank so they sort in rank order."""
+    rows = []
+    for r in list_rows(result)[:top]:
+        row = {"restaurant": f"{r['rank']}. {r['display_name']}"}
+        row.update({label: float(r["member_scores"][m]) for m, label in labels.items()})
+        rows.append(row)
+    return rows
+
+
+MAP_COLORS = {"A": "#1f77b4", "B": "#ff7f0e", "both": "#9467bd"}
+# Okabe-Ito: colorblind-safe, clearly distinct hues; one per member (max 6).
+MEMBER_PALETTE = ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9"]
+TAU_OPTIONS = [0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.0, 3.0]
+TAU_UI_DEFAULT = 0.3
+
+
+def member_colors(labels: dict[str, str]) -> dict[str, str]:
+    """Member label (M1..Mn) -> its palette color, in order."""
+    return {label: MEMBER_PALETTE[i % len(MEMBER_PALETTE)] for i, label in enumerate(labels.values())}
+
+
+def hex_to_rgba(color: str, alpha: int = 220) -> list[int]:
+    color = color.lstrip("#")
+    return [int(color[i:i + 2], 16) for i in (0, 2, 4)] + [alpha]
+
+
+def member_bars_svg(values: list[float], colors: list[str], y_min: float = 0.0, y_max: float = 1.0,
+                    bar_width: int = 26, height: int = 40) -> str:
+    """A tiny bar chart as an SVG data URI: one bar per member in that member's
+    color on a fixed [y_min, y_max] axis, with the value printed above each bar."""
+    import base64
+
+    label_h, gap = 11, 4
+    width = len(values) * (bar_width + gap)
+    span = (y_max - y_min) or 1.0
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'viewBox="0 0 {width} {height}">']
+    for i, (value, color) in enumerate(zip(values, colors)):
+        frac = min(max((float(value) - y_min) / span, 0.0), 1.0)
+        bar_h = frac * (height - label_h)
+        x = i * (bar_width + gap)
+        y = height - bar_h
+        parts.append(f'<rect x="{x}" y="{y:.1f}" width="{bar_width}" height="{bar_h:.1f}" fill="{color}"/>')
+        parts.append(f'<text x="{x + bar_width / 2}" y="{max(y - 2, 9):.1f}" font-size="9" '
+                     f'font-family="sans-serif" text-anchor="middle" fill="#333">{float(value):.2f}</text>')
+    parts.append("</svg>")
+    return "data:image/svg+xml;base64," + base64.b64encode("".join(parts).encode()).decode()
+
+
+def map_points(results: list[dict]) -> list[dict]:
+    """One point per list row (at its best location) with coordinates. With two
+    results, `list` is "A", "B" or "both" (a row is in both if any of its chain
+    locations is in the other list); with one, always "A". Ranks are display
+    ranks; the tooltip adds the API rank where it differs."""
+    def ids(r):
+        return set(r.get("business_ids", [r["business_id"]]))
+
+    def rank_of(r, position):
+        shown = r.get("rank", position)
+        api = r.get("api_rank")
+        return shown, (f"#{shown} (API #{api})" if api not in (None, shown) else f"#{shown}")
+
+    rows = [list(res["restaurants"]) for res in results]
+    entries, matched_b = [], set()
+    for pos_a, r in enumerate(rows[0], 1):
+        ranks = {"A": rank_of(r, pos_a)}
+        if len(rows) == 2:
+            for pos_b, rb in enumerate(rows[1], 1):
+                if pos_b not in matched_b and ids(r) & ids(rb):
+                    ranks["B"] = rank_of(rb, pos_b)
+                    matched_b.add(pos_b)
+                    break
+        entries.append((r, ranks))
+    if len(rows) == 2:
+        entries += [(rb, {"B": rank_of(rb, pos_b)}) for pos_b, rb in enumerate(rows[1], 1) if pos_b not in matched_b]
+
+    points = []
+    for r, ranks in entries:
+        if r.get("lat") is None or r.get("lon") is None:
+            continue
+        which = "both" if len(ranks) == 2 else next(iter(ranks))
+        rank_text = (" · ".join(f"{k} {text}" for k, (_, text) in ranks.items()) if len(rows) == 2
+                     else ranks["A"][1])
+        points.append({"lat": float(r["lat"]), "lon": float(r["lon"]), "name": r.get("name"),
+                       "list": which, "color": MAP_COLORS[which], "rgba": hex_to_rgba(MAP_COLORS[which]),
+                       "rank_a": ranks.get("A", (None,))[0], "rank_b": ranks.get("B", (None,))[0],
+                       "tooltip": f"{r.get('name')} ({rank_text})"})
+    return points
+
+
+TILE_PX = 512  # deck.gl / Mapbox zoom convention: the world is 512 px wide at zoom 0
+
+
+def fit_view(points: list[dict], width_px: int = 1000, height_px: int = 380, padding: float = 0.15,
+             max_zoom: float = 15.0) -> dict:
+    """Center and Web-Mercator zoom (deck.gl convention) that fit every point in
+    a width x height map, leaving `padding` (a fraction of each side's span)."""
+    import math
+
+    if not points:
+        return {"latitude": 39.9526, "longitude": -75.1652, "zoom": 11.0}  # Philadelphia
+    lats = [p["lat"] for p in points]
+    lons = [p["lon"] for p in points]
+
+    def merc_y(lat):
+        return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+    lon_span = (max(lons) - min(lons)) * (1 + 2 * padding)
+    y_span = (merc_y(max(lats)) - merc_y(min(lats))) * (1 + 2 * padding)
+    zooms = [max_zoom]
+    if lon_span > 0:
+        zooms.append(math.log2(width_px * 360 / (TILE_PX * lon_span)))
+    if y_span > 0:
+        zooms.append(math.log2(height_px * 2 * math.pi / (TILE_PX * y_span)))
+    return {"latitude": (min(lats) + max(lats)) / 2, "longitude": (min(lons) + max(lons)) / 2,
+            "zoom": round(min(zooms), 2)}
+
+
+def member_score_bounds(results: list[dict], norm: str) -> tuple[float, float]:
+    """Shared y-range for the per-member bars: [0, 1] for rank percentiles,
+    otherwise the min/max over every shown member score."""
+    if norm == "rank":
+        return 0.0, 1.0
+    values = [float(v) for res in results for r in res["restaurants"] for v in r["member_scores"].values()]
+    return (min(values), max(values)) if values else (0.0, 1.0)
 
 
 def format_api_error(message: str) -> str:
@@ -138,10 +361,12 @@ def main() -> None:
     from src.ui_common import APIError, get, post
 
     st.set_page_config(page_title="Group Dinner", page_icon="🍽️", layout="wide")
-    st.title("Group Dinner")
-    st.caption("Pick a group, choose two ways to aggregate their tastes, and compare the lists.")
     state = st.session_state
     params = st.query_params
+
+    @st.cache_data(ttl=600, show_spinner="Asking the API…")
+    def cached_post(path: str, payload_json: str) -> dict:
+        return post(path, json=json.loads(payload_json))
 
     def show_error(e: Exception) -> None:
         st.error(format_api_error(str(e)))
@@ -150,28 +375,31 @@ def main() -> None:
         sample = get("/group/users/sample", params={"n": n, "cohesion": cohesion, "seed": seed})
         state["members"] = [u["user_id"] for u in sample["users"]]
         state["profiles"] = sample["users"]
-        state["sample_note"] = (f"Sampled from val group {sample['group_id']} (cohesion {sample['cohesion']:.2f})"
-                                if "group_id" in sample else "Random val users")
-        state.pop("comparison", None)
+        state["sample_note"] = (f"Sampled from val group {sample['group_id']}"
+                                if "group_id" in sample else f"{n} random val users")
 
-    # ---- 1. members
-    st.subheader("1. Members")
-    draw_col, type_col = st.columns(2)
-    with draw_col:
-        st.markdown("**Draw a sample group**")
-        cohesion = st.radio("Cohesion", ["low", "high", "any"], horizontal=True,
-                            index=["low", "high", "any"].index(params.get("cohesion", "low"))
-                            if params.get("cohesion", "low") in ("low", "high", "any") else 0)
-        seed = st.number_input("Seed", min_value=0, value=int(params.get("seed", 42)), step=1)
-        n = st.slider("Members", MIN_MEMBERS, MAX_MEMBERS, int(params.get("n", 4)))
-        if st.button("Draw sample group"):
-            try:
-                load_sample(n, cohesion, int(seed))
-            except APIError as e:
-                show_error(e)
-    with type_col:
-        st.markdown("**Or enter user IDs**")
-        typed = st.text_area(f"{MIN_MEMBERS}–{MAX_MEMBERS} user IDs, comma or newline separated", height=110)
+    # ---- sidebar: group -----------------------------------------------------------
+    sb = st.sidebar
+    sb.header("Group")
+    sb.subheader("Next sample")
+    sb.caption("Applies when you sample a new group.")
+    cohesion_choices = ["any", "high", "low"]
+    n = sb.slider("Group size", MIN_MEMBERS, MAX_MEMBERS, int(params.get("n", 4)))
+    default_cohesion = params.get("cohesion", "low")
+    cohesion_pick = sb.radio(
+        "Cohesion", cohesion_choices, horizontal=True,
+        index=cohesion_choices.index(default_cohesion) if default_cohesion in cohesion_choices else 2,
+        help="high / low: members of a real val group from that half of the cohesion distribution; "
+             "any: random val users",
+    )
+    seed = sb.number_input("Seed", min_value=0, value=int(params.get("seed", 42)), step=1)
+    if sb.button("Sample a new group", type="primary"):
+        try:
+            load_sample(n, cohesion_pick, int(seed))
+        except APIError as e:
+            show_error(e)
+    with sb.expander("Or enter user IDs"):
+        typed = st.text_area(f"{MIN_MEMBERS}–{MAX_MEMBERS} user IDs, comma or newline separated", height=100)
         if st.button("Use these IDs"):
             ids, problem = parse_member_ids(typed)
             if problem:
@@ -181,96 +409,227 @@ def main() -> None:
                     state["profiles"] = get("/group/users/profiles", params={"user_ids": ids})["users"]
                     state["members"] = ids
                     state["sample_note"] = "Entered by hand"
-                    state.pop("comparison", None)
                 except APIError as e:
                     show_error(e)
 
-    # deep link: ?cohesion=…&seed=…&n=… draws and compares once on load
+    # ---- sidebar: strategy ----------------------------------------------------------
+    sb.header("Strategy")
+    compare = sb.toggle("Compare two strategies", value=params.get("compare", "1") != "0")
+    default_a = params.get("strategy", "average")
+    strategy_a = sb.selectbox("Strategy A" if compare else "Strategy", STRATEGIES,
+                              index=STRATEGIES.index(default_a) if default_a in STRATEGIES else 0)
+    strategy_b = None
+    if compare:
+        default_b = params.get("strategy_b", "least_misery")
+        strategy_b = sb.selectbox("Strategy B", STRATEGIES,
+                                  index=STRATEGIES.index(default_b) if default_b in STRATEGIES else 1)
+    norm = sb.selectbox(
+        "Normalization", list(NORM_HELP), index=0,
+        help="How each member's scores are put on a common scale before aggregating. "
+             + "; ".join(f"{name}: {text}" for name, text in NORM_HELP.items()),
+    )
+    lam = 0.5
+    if "fairness" in (strategy_a, strategy_b):
+        lam = sb.slider("λ (fairness)", 0.0, 1.0, 0.5, 0.05,
+                        help="fairness score = mean − λ·(max − min) over members")
+    tau = None
+    if "fairness_repeated" in (strategy_a, strategy_b):
+        tau = sb.select_slider(
+            "τ (fairness_repeated)", options=TAU_OPTIONS, value=TAU_UI_DEFAULT,
+            help="τ=0.1 is the pre-registered evaluation default; 0.3 performed better per dinner on validation.",
+        )
+    # the API caps k at 50, and the page asks for k + EXTRA_FETCH
+    k = sb.number_input("Results (k)", min_value=1, max_value=50 - EXTRA_FETCH, value=10)
+    include_closed = sb.toggle("Include closed restaurants", value=False)
+
+    # deep link: ?cohesion=…&seed=…&n=… draws a group once on load
     if "cohesion" in params and "members" not in state:
         try:
             load_sample(int(params.get("n", 4)), params["cohesion"], int(params.get("seed", 42)))
-            state["autorun"] = True
         except APIError as e:
             show_error(e)
 
+    # ---- main ------------------------------------------------------------------------
+    st.title("Group Dinner")
     members = state.get("members")
     if not members:
-        st.info("Draw a sample group or enter user IDs to begin.")
+        st.info("Sample a group or enter user IDs in the sidebar to begin.")
         return
     labels = member_labels(members)
-    st.caption(state.get("sample_note", ""))
-    profile_cols = st.columns(len(members))
-    for col, user in zip(profile_cols, state.get("profiles", [])):
-        with col:
-            st.markdown(f"**{labels[user['user_id']]}** · `{user['user_id'][:10]}…`")
-            for p in user["profile"]:
-                st.markdown(f"- {p['name']} ({p['stars']:.0f}★)")
 
-    # ---- 2. options
-    st.subheader("2. Options")
-    o1, o2, o3, o4 = st.columns([2, 2, 1, 1])
-    strategy_a = o1.selectbox("Strategy A", STRATEGIES, index=0)
-    strategy_b = o2.selectbox("Strategy B", STRATEGIES, index=1)
-    k = o3.number_input("k", min_value=1, max_value=50, value=10)
-    include_closed = o4.toggle("Include closed", value=False)
-
-    if st.button("Compare", type="primary") or state.pop("autorun", False):
-        try:
-            state["comparison"] = post("/group/compare", json={
-                "members": members, "strategies": [strategy_a, strategy_b],
-                "k": int(k), "include_closed": include_closed,
-            })
-        except APIError as e:
-            show_error(e)
-            state.pop("comparison", None)
-
-    comparison = state.get("comparison")
-    if not comparison:
+    colors = member_colors(labels)
+    payload = {"members": members, "norm": norm, "lam": lam, "k": int(k) + EXTRA_FETCH,
+               "include_closed": include_closed}
+    if tau is not None:
+        payload["tau"] = tau
+    if compare:
+        payload["strategies"] = [strategy_a, strategy_b]
+    else:
+        payload["strategy"] = strategy_a
+    try:
+        response = cached_post("/group/compare" if compare else "/group/recommend",
+                               json.dumps(payload, sort_keys=True))
+    except APIError as e:
+        show_error(e)
         return
+    # collapse chains and keep k distinct names; overlap, deltas and map use these trimmed lists
+    results = [trim_result(r, int(k)) for r in (response["results"] if compare else [response])]
+    overlap = overlap_count(results[0]["restaurants"], results[1]["restaurants"]) if compare else None
 
-    # ---- 3/4. side-by-side lists and summaries
-    st.subheader("3. Comparison")
-    results = comparison["results"]
-    id_sets = [{r["business_id"] for r in res["restaurants"]} for res in results]
-    st.markdown(f"**List overlap: {comparison['overlap']} of {len(results[0]['restaurants'])}** "
-                "(highlighted rows appear in both lists)")
-    for col, res, other in zip(st.columns(2), results, reversed(id_sets)):
+    # group and cohesion
+    cohesion = results[0]["cohesion"]
+    c1, c2 = st.columns([1, 4])
+    c1.metric("Group cohesion", f"{cohesion:.2f}",
+              help=f"Mean pairwise similarity of the members' taste profiles. Among val groups, a third "
+                   f"are below {COHESION_LOW} and a third above {COHESION_HIGH}.")
+    c2.markdown(f"**{cohesion_reading(cohesion)}**  \n{state.get('sample_note', '')} · {len(members)} members")
+    for col, user in zip(st.columns(len(members)), state.get("profiles", [])):
         with col:
-            summary = res["summary"]
-            st.markdown(f"### {res['strategy']}")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Group score (predicted)", f"{summary['group_utility_predicted']:.3f}")
-            m2.metric("Worst member (predicted)", f"{summary['worst_member_predicted']:.3f}")
-            m3.metric("Fairness gap (predicted)", f"{summary['fairness_gap_predicted']:.3f}")
-            table = pd.DataFrame(display_rows(res, other, labels))
-            # one compact cell per row: a small bar per member, in M1..Mn order
-            table["members"] = table[list(labels.values())].values.tolist()
-            styled = table.style.apply(
-                lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row["in_both"] else "" for _ in row],
-                axis=1,
+            label = labels[user["user_id"]]
+            st.markdown(
+                f'<span style="display:inline-block;width:0.8em;height:0.8em;border-radius:2px;'
+                f'background:{colors[label]};margin-right:0.35em"></span>'
+                f'<b style="color:{colors[label]}">{label}</b> · <code>{user["user_id"][:10]}…</code>',
+                unsafe_allow_html=True,
             )
-            column_config = {
-                "in_both": None,
-                "rank": st.column_config.NumberColumn("#", width=30),
-                "name": st.column_config.TextColumn("name", width=170),
-                "categories": st.column_config.TextColumn("categories", width=130),
-                "price": st.column_config.TextColumn("price", width=45),
-                "score": st.column_config.NumberColumn("score", format="%.3f", width=55),
-                "members": st.column_config.BarChartColumn(
-                    " · ".join(labels.values()), y_min=0.0, y_max=1.0, width=110,
-                    help="Each member's predicted score for this restaurant, M1 to Mn left to right",
-                ),
-                **{label: None for label in labels.values()},  # numbers stay in the data, not as columns
-            }
-            st.dataframe(styled, column_config=column_config, hide_index=True, width="stretch")
-            if res["strategy"] == "fairness_repeated":
-                with st.expander("Per-dinner view (fairness_repeated)", expanded=False):
-                    st.dataframe(pd.DataFrame(dinner_rows(res, labels)), hide_index=True,
-                                 width="stretch")
-    st.caption(
-        "Predicted scores reflect similarity to each member's history and are weakly calibrated to actual "
-        f"star ratings ([README: Group evaluation]({README_CALIBRATION}))."
+            st.caption("Top-rated: " + "; ".join(f"{p['name']} ({p['stars']:.0f}★)" for p in user["profile"]))
+
+    y_min, y_max = member_score_bounds(results, norm)
+    color_list = [colors[label] for label in labels.values()]
+    n_members = len(labels)
+    member_bars = st.column_config.ImageColumn(
+        " · ".join(labels.values()), width=max(110, n_members * 30 + 10),
+        help=f"Each member's predicted score ({norm}) on a fixed {y_min:g}–{y_max:g} scale, "
+             "in the member colors above",
     )
+
+    def bars_column(table: pd.DataFrame) -> list[str]:
+        return [member_bars_svg(row, color_list, y_min, y_max)
+                for row in table[list(labels.values())].values.tolist()]
+
+    rank_column = st.column_config.NumberColumn(
+        "#", width=30, help="Rank among distinct restaurants (chains collapsed). The API's own rank, which "
+                            "counts every chain location, is in the API # column when it differs.")
+
+    def api_rank_column(table: pd.DataFrame):
+        if (table["api_rank"] == table["rank"]).all():
+            return None  # identical everywhere: hide
+        return st.column_config.NumberColumn("API #", width=45, help="Rank in the API's response, before "
+                                                                     "chain locations were collapsed")
+
+    def score_column(res: dict):
+        if res["strategy"] == "fairness_repeated":
+            return st.column_config.NumberColumn(
+                "dinner score (weighted)", format="%.3f", width=150,
+                help="The weighted group score when that dinner was chosen (members served worst so far "
+                     "weigh more). The list is in dinner order, not sorted by this score.")
+        return st.column_config.NumberColumn("score", format="%.3f", width=55)
+
+    def metrics(summary: dict, deltas: dict | None = None) -> None:
+        m1, m2, m3 = st.columns(3)
+        d = deltas or {}
+        m1.metric("Group score (predicted)", f"{summary['group_utility_predicted']:.3f}",
+                  delta=f"{d['group_utility_predicted']:+.3f} vs A" if d else None)
+        m2.metric("Worst member (predicted)", f"{summary['worst_member_predicted']:.3f}",
+                  delta=f"{d['worst_member_predicted']:+.3f} vs A" if d else None)
+        m3.metric("Fairness gap (predicted)", f"{summary['fairness_gap_predicted']:.3f}",
+                  delta=f"{d['fairness_gap_predicted']:+.3f} vs A" if d else None, delta_color="inverse")
+
+    def per_dinner(res: dict) -> None:
+        if res["strategy"] == "fairness_repeated":
+            with st.expander("Per-dinner view (fairness_repeated: one pick per dinner, in order)"):
+                st.caption("Weights show how much each member counted when that dinner was picked; "
+                           "members served worst so far get more weight.")
+                st.dataframe(pd.DataFrame(dinner_rows(res, labels)), hide_index=True, width="stretch")
+
+    if compare:
+        id_sets = [{b for r in res["restaurants"] for b in r.get("business_ids", [r["business_id"]])}
+                   for res in results]
+        st.subheader(f"{strategy_a} vs. {strategy_b}")
+        st.markdown(f"**List overlap: {overlap} of {len(results[0]['restaurants'])}** "
+                    "(highlighted rows appear in both lists)")
+        deltas = metric_deltas(results[0]["summary"], results[1]["summary"])
+        for i, (col, res, other) in enumerate(zip(st.columns(2), results, reversed(id_sets))):
+            with col:
+                st.markdown(f"### {'A' if i == 0 else 'B'}: {res['strategy']}")
+                metrics(res["summary"], deltas if i == 1 else None)
+                table = pd.DataFrame(display_rows(res, other, labels))
+                table["members"] = bars_column(table)
+                styled = table.style.apply(
+                    lambda row: ["background-color: rgba(255, 196, 0, 0.25)" if row["in_both"] else ""
+                                 for _ in row],
+                    axis=1,
+                )
+                st.dataframe(styled, hide_index=True, width="stretch", row_height=46,
+                             height=(len(table) + 1) * 46 + 3, column_config={
+                    "in_both": None,
+                    "rank": rank_column,
+                    "api_rank": api_rank_column(table),
+                    "name": st.column_config.TextColumn("name", width=150),
+                    "categories": st.column_config.TextColumn("categories", width=110),
+                    "price": st.column_config.TextColumn("price", width=45),
+                    "score": score_column(res),
+                    "members": member_bars,
+                    **{label: None for label in labels.values()},
+                })
+                per_dinner(res)
+    else:
+        res = results[0]
+        st.subheader(res["strategy"])
+        metrics(res["summary"])
+        left, right = st.columns([3, 2])
+        with left:
+            table = pd.DataFrame(display_rows(res, set(), labels))
+            st.dataframe(table[["rank", "api_rank", "name", "categories", "price", "score"]], hide_index=True,
+                         width="stretch", column_config={
+                             "rank": rank_column,
+                             "api_rank": api_rank_column(table),
+                             "score": score_column(res),
+                         })
+        with right:
+            st.markdown("**Top 5: each member's predicted score**")
+            chart = pd.DataFrame(top_member_rows(res, labels)).set_index("restaurant")
+            st.bar_chart(chart, stack=False, horizontal=True, height=320, color=color_list,
+                         x_label=f"predicted score ({norm})", y_label="")
+        per_dinner(res)
+
+    # map
+    import pydeck as pdk
+
+    point_list = map_points(results)
+    st.subheader("Map")
+    if not point_list:
+        st.caption("No coordinates for these restaurants.")
+    else:
+        layer = pdk.Layer(
+            "ScatterplotLayer", data=pd.DataFrame(point_list), get_position="[lon, lat]",
+            get_fill_color="rgba", get_line_color=[255, 255, 255], line_width_min_pixels=1.5, stroked=True,
+            get_radius=90, radius_min_pixels=8, radius_max_pixels=16, pickable=True,
+        )
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=pdk.ViewState(**fit_view(point_list)),
+                                 tooltip={"text": "{tooltip}"}, map_style=None), height=380)
+        legend = [("A", f"only in A ({strategy_a})"), ("B", f"only in B ({strategy_b})"), ("both", "in both")] \
+            if compare else [("A", res["strategy"])]
+        st.markdown(" ".join(
+            f'<span style="display:inline-block;width:0.75em;height:0.75em;border-radius:50%;'
+            f'background:{MAP_COLORS[key]};margin:0 0.3em 0 0.9em"></span>{text}' for key, text in legend
+        ) + " · hover a pin for name and rank", unsafe_allow_html=True)
+
+    with st.expander("How this works", expanded=False):
+        st.markdown(
+            "- Each member's taste is the average embedding of the restaurants they rated 4+ stars, and each "
+            "restaurant's embedding comes from its review text. Scores are **predicted** from those review "
+            "embeddings, not measured satisfaction.\n"
+            "- Scores are put on a common per-member scale (the *Normalization* setting), then combined by the "
+            "strategy: **average** (mean over members), **least_misery** (the least happy member), "
+            "**fairness** (mean − λ·spread), or **fairness_repeated** (a sequence of dinners that takes turns "
+            "favoring whoever has been served worst so far).\n"
+            "- Predicted scores reflect similarity to each member's history and are **weakly calibrated** to "
+            "actual star ratings (Spearman ≈ 0.01 on held-out reviews). "
+            f"See [README: Group evaluation]({README_CALIBRATION}).\n"
+            "- Places a member already reviewed are left out, and closed restaurants are hidden unless "
+            "*Include closed restaurants* is on. A chain appears once, as \"(N locations)\"."
+        )
 
 
 if __name__ == "__main__":
