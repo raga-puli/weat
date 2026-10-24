@@ -30,10 +30,14 @@ without one, the module-level model behind embed() is used.
 """
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import urllib.request
 from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,6 +46,21 @@ from src import interfaces
 from src.query_parser import ANCHORS, ParsedQuery
 
 MODEL_NAME = "all-MiniLM-L6-v2"
+MAX_SEQ_LENGTH = 256  # SentenceTransformer(MODEL_NAME).max_seq_length; inputs are truncated to this
+
+# Query encoder backend: ENCODER=torch (sentence-transformers; the default, and what embed.py uses for
+# the restaurant embeddings) or ENCODER=onnx (onnxruntime + tokenizers, no torch; the API image).
+# The ONNX files are the model repo's own export at a pinned revision, checked by sha256. On
+# eval/queries.jsonl the two backends give query vectors with cosine >= 0.9999999 and identical
+# numpy-search top-10s. The Dockerfile pins the same URLs and hashes (tests/test_search.py checks).
+ENCODERS = ("torch", "onnx")
+ONNX_DIR = Path("models") / f"{MODEL_NAME}-onnx"
+ONNX_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+ONNX_FILES = {  # file name in ONNX_DIR -> (path in the HF repo, sha256)
+    "model.onnx": ("onnx/model.onnx", "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"),
+    "tokenizer.json": ("tokenizer.json", "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"),
+}
+ONNX_URL = "https://huggingface.co/sentence-transformers/{model}/resolve/{revision}/{path}"
 DEFAULT_NEAR_KM = 2.0
 OPEN_AT_OVERFETCH = 5
 EARTH_RADIUS_KM = 6371.0
@@ -67,10 +86,81 @@ _model = None
 _frame = None
 
 
+class OnnxEncoder:
+    """MODEL_NAME without torch, matching SentenceTransformer(MODEL_NAME): BERT tokenizer truncated at
+    MAX_SEQ_LENGTH, token embeddings, mean pooling over the attention mask, L2 normalization."""
+
+    def __init__(self, model_dir: Path = ONNX_DIR):
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        missing = [name for name in ONNX_FILES if not (Path(model_dir) / name).exists()]
+        if missing:
+            raise RuntimeError(f"ENCODER=onnx but {model_dir} is missing {missing}; "
+                               "run `python -m src.search --download-onnx`")
+        self.tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        self.tokenizer.enable_truncation(MAX_SEQ_LENGTH)
+        self.tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+        options = ort.SessionOptions()
+        options.log_severity_level = 3  # errors only
+        self.session = ort.InferenceSession(str(Path(model_dir) / "model.onnx"), options,
+                                            providers=["CPUExecutionProvider"])
+        self.input_names = {i.name for i in self.session.get_inputs()}
+
+    def encode(self, text, normalize_embeddings: bool = True) -> np.ndarray:
+        """Like SentenceTransformer.encode: one string -> (384,), a list -> (n, 384); float32."""
+        single = isinstance(text, str)
+        batch = self.tokenizer.encode_batch([text] if single else list(text))
+        feeds = {
+            "input_ids": np.array([e.ids for e in batch], dtype=np.int64),
+            "attention_mask": np.array([e.attention_mask for e in batch], dtype=np.int64),
+            "token_type_ids": np.array([e.type_ids for e in batch], dtype=np.int64),
+        }
+        tokens = self.session.run(None, {k: v for k, v in feeds.items() if k in self.input_names})[0]
+        mask = feeds["attention_mask"][..., None].astype(np.float32)
+        pooled = (tokens * mask).sum(axis=1) / np.clip(mask.sum(axis=1), 1e-9, None)
+        if normalize_embeddings:
+            pooled = pooled / np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12, None)
+        pooled = pooled.astype(np.float32)
+        return pooled[0] if single else pooled
+
+
+def encoder_backend() -> str:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    backend = os.getenv("ENCODER", "torch").strip().lower()
+    if backend not in ENCODERS:
+        raise ValueError(f"ENCODER must be one of {ENCODERS}, got {backend!r}")
+    return backend
+
+
 def load_encoder():
+    """The query encoder for ENCODER (torch | onnx; default torch)."""
+    if encoder_backend() == "onnx":
+        return OnnxEncoder()
     from sentence_transformers import SentenceTransformer
 
     return SentenceTransformer(MODEL_NAME)
+
+
+def download_onnx_model(model_dir: Path = ONNX_DIR) -> None:
+    """Fetch ONNX_FILES at ONNX_REVISION into model_dir, refusing any file whose sha256 differs."""
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    for name, (repo_path, sha256) in ONNX_FILES.items():
+        dest = model_dir / name
+        if dest.exists() and hashlib.sha256(dest.read_bytes()).hexdigest() == sha256:
+            print(f"{dest}: present, sha256 ok")
+            continue
+        url = ONNX_URL.format(model=MODEL_NAME, revision=ONNX_REVISION, path=repo_path)
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != sha256:
+            raise RuntimeError(f"{url}: sha256 {digest} != pinned {sha256}; not saved")
+        dest.write_bytes(data)
+        print(f"{dest}: downloaded {len(data) / 1e6:.1f} MB, sha256 ok")
 
 
 def embed(text: str) -> np.ndarray:
@@ -393,10 +483,17 @@ def main(argv=None) -> None:
     from src.query_parser import parse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("query")
+    parser.add_argument("query", nargs="?")
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--include-null-price", action="store_true")
+    parser.add_argument("--download-onnx", action="store_true",
+                        help=f"fetch the pinned ONNX encoder files into {ONNX_DIR} (for ENCODER=onnx)")
     args = parser.parse_args(argv)
+    if args.download_onnx:
+        download_onnx_model()
+        return
+    if not args.query:
+        parser.error("QUERY is required (or use --download-onnx)")
 
     parsed = parse(args.query)
     print("parsed:")

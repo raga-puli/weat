@@ -8,13 +8,13 @@ A group restaurant recommender built from the Yelp Academic Dataset, scoped to P
 
 ## File ownership (WEEK 4)
 
-Supersedes the week 3 table; week 4 = everything each person owned in week 3 plus the new files.
+Supersedes the week 3 table; week 4 = everything each person owned in week 3 plus the new files. Amended by the week 4 scaffolding PR (both people agreed): `tests/test_human_eval.py` and the rest of `docs/` to B, `requirements-api.txt` and `tests/test_ui_common.py` shared.
 
 | Person | Owns |
 | --- | --- |
 | A | `src/prep.py`, `src/split.py`, `src/embed.py`, `src/recommend.py`, `src/groups.py`, `src/aggregate.py`, `src/group_eval.py`, `src/db_groups.py`, `db/groups.sql`, `results/groups.md`, `tests/test_groups.py`, `tests/test_aggregate.py`, `tests/test_group_eval.py`, `tests/test_embed.py`, `tests/test_recommend.py`, `README.md`, `src/api/routes_group.py`, `src/pages/1_Group_Dinner.py`, `src/mf.py`, `tests/test_api_group.py`, `tests/test_mf.py`, `src/deploy_load.py`, `deploy/` (all files), `docs/search.md` |
-| B | `src/eval.py`, `src/baselines.py`, `results.md`, `src/query_parser.py`, `src/search.py`, `src/db.py`, `src/bench.py`, `docker-compose.yml`, `eval/queries.jsonl`, `results/parser.md`, `results/latency.md`, `tests/test_query_parser.py`, `tests/test_search.py`, `src/api/routes_search.py`, `src/pages/2_Search.py`, `Dockerfile`, `.dockerignore`, `tests/test_api_search.py`, `src/pages/3_Blind_Eval.py`, `src/human_eval.py`, `docs/human_eval_protocol.md`, `docs/groups.md`, `results/human_eval.md` |
-| Shared, FROZEN | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore`, `.env.example`, `db/schema.sql`, `src/api/main.py`, `src/app.py`, `src/ui_common.py`, `docs/frozen_configs.md` |
+| B | `src/eval.py`, `src/baselines.py`, `results.md`, `src/query_parser.py`, `src/search.py`, `src/db.py`, `src/bench.py`, `docker-compose.yml`, `eval/queries.jsonl`, `results/parser.md`, `results/latency.md`, `tests/test_query_parser.py`, `tests/test_search.py`, `src/api/routes_search.py`, `src/pages/2_Search.py`, `Dockerfile`, `.dockerignore`, `tests/test_api_search.py`, `src/pages/3_Blind_Eval.py`, `src/human_eval.py`, `docs/human_eval_protocol.md`, `docs/groups.md`, `results/human_eval.md`, `tests/test_human_eval.py`, `docs/` (every file not assigned elsewhere in this table, including `docs/screenshots/`) |
+| Shared, FROZEN | `CLAUDE.md`, `src/interfaces.py`, `requirements.txt`, `.gitignore`, `.env.example`, `db/schema.sql`, `src/api/main.py`, `src/app.py`, `src/ui_common.py`, `docs/frozen_configs.md`, `requirements-api.txt`, `tests/test_ui_common.py` |
 
 ### Rules
 
@@ -39,7 +39,9 @@ Supersedes the week 3 table; week 4 = everything each person owned in week 3 plu
 
 - Windows, PowerShell, CPU-only torch.
 - Python virtualenv lives in `.venv`. Activate it before running anything: `.venv\Scripts\Activate.ps1`
-- Install deps: `pip install -r requirements.txt`
+- Install deps: `pip install -r requirements.txt` (the full pipeline, including torch for `src/embed.py`). The API/UI Docker image installs `requirements-api.txt` instead: no torch; the search query encoder runs on onnxruntime (`ENCODER=onnx`).
+- Query encoder: `ENCODER=torch` (default) or `ENCODER=onnx` in `.env`. Both give the same query vectors (cosine >= 0.9999999 on `eval/queries.jsonl`). Locally, `onnx` needs the pinned model files: `python -m src.search --download-onnx` (writes `models/`, gitignored; the image downloads its own copy).
+- Streamlit pages call the API only through `src/ui_common.py`, which waits for a sleeping host ("Waking up the server, about a minute") and retries 503s that carry Retry-After; pages don't add their own retry loops.
 - Postgres + pgvector run in Docker (`docker compose up -d`, see docker-compose.yml); copy `.env.example` to `.env`.
 
 ## Pipeline (run in order)
@@ -76,7 +78,10 @@ Run everything from the repo root as `python -m src.<module>` (paths are relativ
 | `src.groups` | none |
 | `src.group_eval` | `--split {val,test}`, `--i-mean-it`, `--sample N`, `--normalization/--norm {raw,zscore,rank}` (default rank), `--strategy NAME` or `--all` (default), `--lam X` (default 0.5), `--log NOTE`, `--tau-sensitivity` |
 | `src.db` | command `load` or `check` |
-| `src.search` | `QUERY`, `--k N` (default 10), `--include-null-price` |
+| `src.search` | `QUERY`, `--k N` (default 10), `--include-null-price`; or `--download-onnx` alone |
+| `src.recommend` | command `build-cache`, `--model {ContentBased,ContentBasedBlob,ContentBasedCentered,ContentBasedDebiased}` (default ContentBasedDebiased) |
+| `src.deploy_load` | `--database-url URL` (default DATABASE_URL from the environment / .env), `--demo-users N` (default 500), `--sample-groups N` (default 100), `--seed N` (default SEED) |
+| `src.human_eval` | `--select-groups`, `--log NOTE`, `--responses PATH` (default data/human_eval/responses.csv) |
 | `src.query_parser` | `[TEXT]`, `--eval`, `--log NOTE` |
 | `src.bench` | `--log NOTE`, `--runs N` (default 200), `--warmup N` (default 10), `--seconds S` (default 30) |
 

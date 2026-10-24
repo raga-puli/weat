@@ -321,3 +321,79 @@ def test_build_query_include_closed():
     sql, _ = s.build_query(ParsedQuery(), 10, include_closed=False)
     assert "is_open IS NOT FALSE" in sql
     assert "is_open" not in s.build_query(ParsedQuery(), 10)[0]
+
+
+# ---------- query encoder backends (ENCODER=torch | onnx) ----------
+
+
+def test_onnx_encoder_mean_pools_over_the_mask_and_normalizes():
+    from types import SimpleNamespace
+
+    enc = s.OnnxEncoder.__new__(s.OnnxEncoder)  # skip loading files: fake tokenizer and session
+    enc.tokenizer = SimpleNamespace(encode_batch=lambda texts: [
+        SimpleNamespace(ids=[1, 2, 0], attention_mask=[1, 1, 0], type_ids=[0, 0, 0]),
+        SimpleNamespace(ids=[3, 4, 5], attention_mask=[1, 1, 1], type_ids=[0, 0, 0]),
+    ][: len(texts)])
+    tokens = np.array([[[3.0, 0.0], [1.0, 0.0], [100.0, 100.0]],  # the padded token must not count
+                       [[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]]], dtype=np.float32)
+    enc.session = SimpleNamespace(run=lambda outputs, feeds: [tokens[: len(feeds["input_ids"])]])
+    enc.input_names = {"input_ids", "attention_mask", "token_type_ids"}
+
+    batch = enc.encode(["a b", "c d e"])
+    assert batch.dtype == np.float32 and batch.shape == (2, 2)
+    np.testing.assert_allclose(batch, [[1.0, 0.0], [0.0, 1.0]])
+    np.testing.assert_allclose(enc.encode(["a b", "c d e"], normalize_embeddings=False), [[2.0, 0.0], [0.0, 2.0]])
+    assert enc.encode("a b").shape == (2,)  # a single string gives one vector, like SentenceTransformer
+
+
+def test_encoder_backend_reads_ENCODER(monkeypatch):
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.delenv("ENCODER", raising=False)
+    assert s.encoder_backend() == "torch"
+    monkeypatch.setenv("ENCODER", " ONNX ")
+    assert s.encoder_backend() == "onnx"
+    monkeypatch.setenv("ENCODER", "tf")
+    with pytest.raises(ValueError, match="ENCODER"):
+        s.encoder_backend()
+
+
+def test_onnx_encoder_without_model_files_says_how_to_get_them(tmp_path):
+    pytest.importorskip("onnxruntime")
+    with pytest.raises(RuntimeError, match="--download-onnx"):
+        s.OnnxEncoder(tmp_path)
+
+
+def test_dockerfile_pins_the_same_onnx_files_as_search():
+    from pathlib import Path
+
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    for name, (repo_path, sha256) in s.ONNX_FILES.items():
+        url = s.ONNX_URL.format(model=s.MODEL_NAME, revision=s.ONNX_REVISION, path=repo_path)
+        assert f"--checksum=sha256:{sha256}" in dockerfile and url in dockerfile
+        assert f"{s.ONNX_DIR.as_posix()}/{name}" in dockerfile
+    assert "ENCODER=onnx" in dockerfile and "requirements-api.txt" in dockerfile and "torch" not in dockerfile.split("FROM")[1]
+
+
+def test_requirements_api_has_no_torch():
+    from pathlib import Path
+
+    lines = (Path(__file__).resolve().parents[1] / "requirements-api.txt").read_text(encoding="utf-8").splitlines()
+    packages = {line.split("[")[0].strip().lower() for line in lines if line.strip() and not line.startswith("#")}
+    assert {"onnxruntime", "tokenizers"} <= packages
+    assert not packages & {"torch", "sentence-transformers", "transformers"}
+
+
+def test_onnx_matches_torch_on_real_queries():
+    """Skips unless both backends and the downloaded ONNX files are available (a developer machine)."""
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("sentence_transformers")
+    if not all((s.ONNX_DIR / name).exists() for name in s.ONNX_FILES):
+        pytest.skip("run python -m src.search --download-onnx")
+    from sentence_transformers import SentenceTransformer
+
+    texts = ["somewhere cozy", "good for a date", "not too loud, outdoor seating", "best", "x " * 400]
+    torch_vecs = SentenceTransformer(s.MODEL_NAME).encode(texts, normalize_embeddings=True)
+    onnx_vecs = s.OnnxEncoder().encode(texts)
+    assert np.min(np.sum(torch_vecs * onnx_vecs, axis=1)) > 0.9999

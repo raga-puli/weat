@@ -1,0 +1,17 @@
+# API + UI image (Dockerfile). No torch: the query encoder runs on onnxruntime (ENCODER=onnx).
+# Offline pipeline scripts (prep, embed, eval, group_eval, mf, deploy_load) use requirements.txt.
+fastapi
+uvicorn[standard]
+pandas
+pyarrow
+numpy
+scipy
+psycopg[binary]
+pgvector
+python-dotenv
+ollama
+httpx
+requests
+streamlit
+onnxruntime
+tokenizers
