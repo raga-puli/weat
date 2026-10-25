@@ -227,17 +227,5 @@ tests/                366 tests
 
 ---
 
-## 👥 Team
-
-Built by two people, split by **vertical feature slice** rather than by layer. Each of us owns a slice from data through model, SQL, API, and UI.
-
-| | Owns |
-|---|---|
-| **<!-- name -->** | Group aggregation, group evaluation, ALS, deployment |
-| **<!-- name -->** | Evaluation harness, baselines, query parser & hybrid search |
-
-Each of us wrote up the *other's* slice, on the principle that if you can't explain something, you don't understand it.
-
----
 
 <sub>Data © Yelp, used under the Yelp Dataset Terms of Use for non-commercial academic purposes.</sub>
