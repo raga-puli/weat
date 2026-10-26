@@ -13,7 +13,7 @@ A Beli-inspired restaurant recommender for *groups*, built on Yelp reviews of 3,
 <!-- TODO: add a screenshot or GIF of the Group Dinner page -->
 <img src="assets/weat.jpg" width="70%">
 
-**[Live demo →](#)** [thorfinn.streamlit.app](url)
+**[Live demo →](#)** [[thorfinn.streamlit.app](url)](https://thorfinn.streamlit.app/)
 
 ---
 
