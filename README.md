@@ -10,9 +10,10 @@ A Beli-inspired restaurant recommender for *groups*, built on Yelp reviews of 3,
 ![FastAPI](https://img.shields.io/badge/api-fastapi-009688)
 ![Docker](https://img.shields.io/badge/docker-compose-2496ED)
 
+<!-- TODO: add a screenshot or GIF of the Group Dinner page -->
 <img src="assets/weat.jpg" width="70%">
 
-**[Live demo →](#)** https://thorfinn.streamlit.app/
+**[Live demo →](#)** thorfinn.streamlit.app
 
 ---
 
@@ -102,20 +103,32 @@ Confidence intervals are paired cluster bootstraps over target restaurants.
 - **Per-dinner fairness and cumulative fairness are different goals.** Least-misery makes *each* dinner OK for everyone. Sequential fairness takes turns, so each dinner suits someone and it evens out over many dinners. For a one-off dinner, use least-misery. For a recurring group, take turns.
 - **Our first pre-registered setting failed, and we report it.** τ=0.1 was fixed in advance, failed on validation, and failed again on test. A sensitivity analysis on validation (τ ∈ {0.1, 0.3, 1.0, 3.0}, all reported) found τ=0.3, which was then pre-registered and confirmed.
 
-### Individual recommendations (validation set, 25,439 users)
+### Individual recommendations (test set, 25,439 users)
+
+Each frozen configuration ran once on test.
+
+| Model | Recall@10 | NDCG@10 | MRR | Coverage | Spearman ρ |
+|---|---|---|---|---|---|
+| **ALS, 64 factors** (frozen default) | **0.0559** | **0.0289** | **0.0207** | <!-- TODO --> | 0.058 |
+| Popularity (train counts only) | 0.0482 | 0.0250 | 0.0181 | 0.010 | 0.040 |
+| Random | 0.0020 | 0.0008 | 0.0005 | 1.000 | −0.004 |
+| Content-based, per-review chunked | 0.0089 | 0.0042 | 0.0028 | 0.795 | 0.035 |
+| Content-based, single blob (ablation) | 0.0065 | 0.0029 | 0.0019 | 0.811 | 0.058 |
+
+**ALS factor sizes (validation; only the 64-factor default ran on test):**
 
 | Model | Recall@10 | NDCG@10 | Coverage | Spearman ρ |
 |---|---|---|---|---|
-| Popularity (train counts only) | 0.0505 | 0.0270 | 0.010 | 0.044 |
-| Content-based (embeddings, debiased) | 0.0121 | 0.0064 | **0.992** | 0.013 |
+| Popularity (val, for reference) | 0.0505 | 0.0270 | 0.010 | 0.044 |
 | ALS, 32 factors | 0.0745 | 0.0390 | 0.163 | 0.070 |
 | **ALS, 64 factors (pre-set default)** | **0.0695** | **0.0364** | 0.238 | 0.063 |
 | ALS, 128 factors | 0.0666 | 0.0347 | 0.340 | 0.047 |
 
-<!-- TODO: replace with test-set numbers once B's frozen individual-model test run is in. -->
-
-- **Collaborative filtering beats popularity by ~38% on recall@10** (ALS-64 vs. popularity). We headline the 64-factor default because it was fixed in advance, not the 32-factor run that scored highest.
-- **Content embeddings lose to popularity at predicting the next visit, and we say so.** What they offer instead is reach: popularity recommends the same 38 restaurants to nearly everyone, while content-based covers 99% of the catalog. Embeddings are also what make queries like "cozy" possible.
+- **Collaborative filtering beats popularity on test: +16% recall@10, +16% NDCG@10, +14% MRR** (ALS-64 vs. popularity). ALS-64 was frozen before the test run and run once. The 32-factor model scored highest on validation but was never run on test, because 64 was the default fixed in advance.
+- **The lift shrank from validation to test:** +38% recall@10 on validation, +16% on test. We report the test number as the result.
+- **Popularity is a strong baseline:** 24× random on test. Every model has to clear it.
+- **Content embeddings lose to popularity at predicting the next visit, and we say so.** On test, popularity's recall@10 is about 5× the content model's. What embeddings offer instead is reach: popularity recommends the same 38 restaurants to nearly everyone, while content-based covers 80% of the catalog. Embeddings are also what make queries like "cozy" possible.
+- **Per-review encoding beats single-blob encoding:** +37% recall@10 and +43% NDCG@10 on test. The blob version truncated at 256 tokens, before it reached most reviews.
 - **ALS trades accuracy for coverage.** Going from 32 to 128 factors, recall falls from 0.0745 to 0.0666 while coverage doubles.
 - **Hubness correction.** Raw embeddings pushed a few "generic" restaurants to everyone. Centering the user-by-restaurant score matrix cut the top restaurant's share of group lists from 12% to 7.5%, at a recall cost within noise.
 
@@ -141,7 +154,7 @@ We have no live users, so we never **measure** satisfaction. We **predict** it a
 ## 🚀 Quickstart
 
 ```bash
-git clone <repo-url> && cd rnjsjffoodw
+git clone https://github.com/raga-puli/weat.git && cd weat
 ```
 
 **1. Get the data.** Download the [Yelp Open Dataset](https://www.yelp.com/dataset) and extract it to `data/raw/`.
