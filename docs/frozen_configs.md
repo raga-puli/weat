@@ -12,7 +12,7 @@ Each model is run on the test split exactly once, on Day 1, with the invocation 
 | popularity | `python -m src.eval --model src.baselines:Popularity --split test --i-mean-it --log "test, frozen"` | Strongest val baseline: `results.md` 2026-10-02 / 2026-10-16 val popularity, recall@10 0.0505, NDCG@10 0.0270. Train counts only. |
 | content_chunked | `python -m src.eval --model src.recommend:ContentBased --split test --i-mean-it --config "chunked, star-balanced mean" --log "test, frozen"` | Default embedding mode. `results.md` 2026-10-16 val content_chunked (both rows identical): recall@10 0.0100, NDCG@10 0.0047, beats blob on recall/NDCG. Needs `embeddings.npy` from `python -m src.embed` (chunked). |
 | content_blob | `python -m src.eval --model src.recommend:ContentBasedBlob --split test --i-mean-it --config "blob, truncated at 256 tokens" --log "test, frozen"` | Ablation, reported regardless. `results.md` 2026-10-16 val content_blob: recall@10 0.0062, NDCG@10 0.0032. Needs `embeddings_blob.npy` from `python -m src.embed --mode blob`. |
-| ALS | **TBD** — one of `src.mf:ALS32` / `src.mf:ALS` (64) / `src.mf:ALS128` | **No ALS val row exists in `results.md`** (or in README). Person A must log val runs for the configs tried, then freeze the best one here. |
+| ALS | `python -m src.eval --model src.mf:ALS --split test --i-mean-it --config "implicit ALS, 64 factors, reg 0.05, 20 iters, seed 42" --log "FINAL TEST"` (`src.mf:ALS`: 64 factors, reg 0.05, 20 iterations, seed 42, confidence 1 + 10*[stars >= 4]) | Fixed as default before any val run; 32 and 128 reported on val only. |
 
 ## Groups (`src.group_eval`, logs to `results/groups.md`)
 
