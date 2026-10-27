@@ -21,8 +21,6 @@ A Beli-inspired restaurant recommender for *groups*, built on Yelp reviews of 3,
 
 > **Pre-registered and confirmed on a held-out test set.** In groups with divergent tastes, *sequential fairness* (τ=0.3) raised the worst-off member's predicted satisfaction **1.6× more than least-misery** (+0.047 vs +0.029 over average), at **a third less group-utility cost** (−0.012 vs −0.018). It showed no detectable loss in hit rate.
 
-Everything here is *predicted* satisfaction (see [What we can and can't claim](#-what-we-can-and-cant-claim)).
-
 ---
 
 ## 🧭 What it does
